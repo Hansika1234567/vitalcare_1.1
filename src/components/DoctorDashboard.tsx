@@ -9,7 +9,8 @@ import {
   doc, 
   updateDoc, 
   setDoc,
-  orderBy
+  orderBy,
+  addDoc
 } from "../firebase";
 import { UserProfile, Appointment, PatientDoctor, VitalsRecord, HealthAlert } from "../types";
 import { 
@@ -22,7 +23,7 @@ import {
   Tooltip, 
   Legend 
 } from "recharts";
-import { Activity, Calendar, User, Check, X, Bell, TrendingUp, ChevronRight, LogOut } from "lucide-react";
+import { Activity, Calendar, User, Check, X, Bell, TrendingUp, ChevronRight, LogOut, UserPlus } from "lucide-react";
 
 interface DoctorDashboardProps {
   profile: UserProfile;
@@ -41,6 +42,37 @@ export default function DoctorDashboard({ profile, onLogout }: DoctorDashboardPr
   const [activeAlerts, setActiveAlerts] = useState<HealthAlert[]>([]);
 
   const [loading, setLoading] = useState(true);
+
+  // States for sending doctor updates
+  const [doctorNote, setDoctorNote] = useState("");
+  const [sendingNote, setSendingNote] = useState(false);
+  const [noteStatus, setNoteStatus] = useState("");
+
+  const handleSendDoctorNote = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!doctorNote.trim() || !selectedPatientId) return;
+    setSendingNote(true);
+    setNoteStatus("");
+    try {
+      await addDoc(collection(db, "notifications"), {
+        recipient_id: selectedPatientId,
+        recipient_role: "patient",
+        type: "doctor_update",
+        message: `🩺 Dr. ${profile.fullName} sent you an update: "${doctorNote.trim()}"`,
+        related_id: profile.uid,
+        read: false,
+        created_at: new Date().toISOString()
+      });
+      setDoctorNote("");
+      setNoteStatus("Update sent to patient successfully!");
+      setTimeout(() => setNoteStatus(""), 4000);
+    } catch (err) {
+      console.error("Error sending doctor note:", err);
+      setNoteStatus("Failed to send update.");
+    } finally {
+      setSendingNote(false);
+    }
+  };
 
   useEffect(() => {
     if (!profile.uid) return;
@@ -158,8 +190,29 @@ export default function DoctorDashboard({ profile, onLogout }: DoctorDashboardPr
         status: action === "accepted" ? "active" : "inactive",
         assigned_date: new Date().toISOString()
       });
+
+      // 3. Write a notification if accepted
+      if (action === "accepted") {
+        await addDoc(collection(db, "notifications"), {
+          recipient_id: appointment.patient_id,
+          recipient_role: "patient",
+          type: "appointment",
+          message: `📅 Your appointment with Dr. ${profile.fullName} is accepted for ${new Date(appointment.datetime).toLocaleString()}`,
+          related_id: appointment.id,
+          read: false,
+          created_at: new Date().toISOString()
+        });
+      }
     } catch (e) {
       console.error(e);
+    }
+  };
+
+  const handleLinkDecision = async (relation: PatientDoctor, status: "active" | "inactive") => {
+    try {
+      await updateDoc(doc(db, "patient_doctor", relation.id!), { status });
+    } catch (e) {
+      console.error("Error updating link decision:", e);
     }
   };
 
@@ -175,6 +228,8 @@ export default function DoctorDashboard({ profile, onLogout }: DoctorDashboardPr
   const selectedPatientData = assignedPatients.find(p => p.uid === selectedPatientId);
   const latestVital = activeVitals[activeVitals.length - 1]; // latest is at end of asc array
   const activeRisk = latestVital ? latestVital.risk_level : "low";
+
+  const pendingLinks = assignedRelations.filter(r => r.status === "pending");
 
   return (
     <div className="min-h-screen bg-slate-50 flex flex-col pb-12">
@@ -226,13 +281,46 @@ export default function DoctorDashboard({ profile, onLogout }: DoctorDashboardPr
                     <div className="flex gap-2 mt-3">
                       <button
                         onClick={() => handleAppointmentDecision(appt, "accepted")}
-                        className="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white font-bold py-1.5 rounded-xl text-xs shadow-sm"
+                        className="flex-1 bg-emerald-500 hover:bg-emerald-600 text-white font-bold py-2.5 rounded-xl text-xs shadow-sm min-h-[44px]"
                       >
                         Accept
                       </button>
                       <button
                         onClick={() => handleAppointmentDecision(appt, "rejected")}
-                        className="flex-1 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-1.5 rounded-xl text-xs"
+                        className="flex-1 bg-slate-200 hover:bg-slate-300 text-slate-700 font-bold py-2.5 rounded-xl text-xs min-h-[44px]"
+                      >
+                        Decline
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Pending Patient Linking Requests */}
+          {pendingLinks.length > 0 && (
+            <div className="bg-sky-50 border border-sky-200 rounded-3xl p-5 shadow-sm">
+              <h3 className="text-xs font-black text-sky-950 uppercase tracking-wider mb-3 flex items-center gap-1.5">
+                <UserPlus className="h-4 w-4 text-sky-600" /> Pending Patient Links
+              </h3>
+              <div className="space-y-3">
+                {pendingLinks.map((rel) => (
+                  <div key={rel.id} className="p-3 bg-white border border-sky-100 rounded-2xl">
+                    <div className="text-xs font-bold text-slate-950">{rel.patient_name}</div>
+                    <div className="text-[10px] text-slate-500 font-semibold mt-0.5">
+                      Requested: {rel.assigned_date ? new Date(rel.assigned_date).toLocaleDateString() : "Recently"}
+                    </div>
+                    <div className="flex gap-2 mt-3">
+                      <button
+                        onClick={() => handleLinkDecision(rel, "active")}
+                        className="flex-1 bg-sky-500 hover:bg-sky-600 text-white font-bold py-2.5 rounded-xl text-xs shadow-sm transition-colors min-h-[44px]"
+                      >
+                        Accept Link
+                      </button>
+                      <button
+                        onClick={() => handleLinkDecision(rel, "inactive")}
+                        className="flex-1 bg-slate-100 hover:bg-slate-200 text-slate-600 font-bold py-2.5 rounded-xl text-xs transition-colors min-h-[44px]"
                       >
                         Decline
                       </button>
@@ -321,6 +409,32 @@ export default function DoctorDashboard({ profile, onLogout }: DoctorDashboardPr
                     <p><strong className="text-slate-900">Clinical History:</strong> {selectedPatientData.medicalHistory || "No previous history recorded."}</p>
                   </div>
                 </div>
+
+                {/* Send Health Update / Medical Note */}
+                <form onSubmit={handleSendDoctorNote} className="mt-5 border-t pt-4 space-y-3">
+                  <h4 className="text-[10px] font-black text-rose-600 uppercase tracking-wider flex items-center gap-1.5">
+                    🩺 Send Medical Update / Clinical Note
+                  </h4>
+                  <div className="flex gap-2">
+                    <input
+                      type="text"
+                      value={doctorNote}
+                      onChange={(e) => setDoctorNote(e.target.value)}
+                      placeholder="Type clinical advice, prescriptions, or a quick health update for the patient..."
+                      className="flex-1 px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-2xl text-xs font-bold text-slate-800 placeholder-slate-400 outline-none focus:bg-white focus:ring-1 focus:ring-rose-500/20 focus:border-rose-500 transition-all"
+                    />
+                    <button
+                      type="submit"
+                      disabled={sendingNote || !doctorNote.trim()}
+                      className="bg-rose-500 hover:bg-rose-600 disabled:opacity-50 text-white text-xs font-black px-4 py-2.5 rounded-2xl transition-all shadow-sm active:scale-95 cursor-pointer"
+                    >
+                      {sendingNote ? "Sending..." : "Send Note"}
+                    </button>
+                  </div>
+                  {noteStatus && (
+                    <p className="text-[10px] font-bold text-emerald-600 animate-pulse">{noteStatus}</p>
+                  )}
+                </form>
               </div>
 
               {/* Patient Health Analytics (Recharts graph) */}

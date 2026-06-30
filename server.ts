@@ -14,7 +14,8 @@ async function startServer() {
   const app = express();
   const PORT = 3000;
 
-  app.use(express.json());
+  app.use(express.json({ limit: "50mb" }));
+  app.use(express.urlencoded({ limit: "50mb", extended: true }));
 
   // Initialize Gemini AI client lazily to avoid crashing if API key is missing
   let aiClient: GoogleGenAI | null = null;
@@ -48,13 +49,24 @@ async function startServer() {
 
       // Format messages into Content objects for Gemini API
       // Let's filter out system instructions if any, and set them as the systemInstruction parameter
-      const formattedContents = messages.map((m: any) => ({
-        role: m.role === "assistant" ? "model" : "user",
-        parts: [{ text: m.content }]
-      }));
+      const formattedContents = messages.map((m: any) => {
+        const parts: any[] = [{ text: m.content || "Analyze the attached file." }];
+        if (m.attachment && m.attachment.mimeType && m.attachment.data) {
+          parts.push({
+            inlineData: {
+              mimeType: m.attachment.mimeType,
+              data: m.attachment.data
+            }
+          });
+        }
+        return {
+          role: m.role === "assistant" ? "model" : "user",
+          parts
+        };
+      });
 
       const response = await client.models.generateContent({
-        model: "gemini-2.5-flash",
+        model: "gemini-3.5-flash",
         contents: formattedContents,
         config: {
           systemInstruction: "You are the VitalCare Health Assistant. Your goal is to explain health concepts in simple, clear, and plain language suitable for people with little or no formal education. You must use warm, reassuring tones, keep sentences short and easy to understand, and never use dense medical jargon without explaining it simply first. CRITICAL: You are NOT a doctor and cannot diagnose illnesses or prescribe treatments. Always include a disclaimer that this is general information, not a medical diagnosis.",
@@ -65,9 +77,43 @@ async function startServer() {
       const responseText = response.text || "I apologize, but I couldn't generate a response. Please check your vitals and try again.";
       res.json({ text: responseText });
     } catch (error: any) {
-      console.error("Gemini Chat API Error:", error);
+      const isTransientOrQuotaError = error?.status === "RESOURCE_EXHAUSTED" || 
+                                     error?.status === "UNAVAILABLE" ||
+                                     error?.code === 429 || 
+                                     error?.code === 503 ||
+                                     error?.message?.includes("quota") || 
+                                     error?.message?.includes("limit") ||
+                                     error?.message?.includes("exhausted") ||
+                                     error?.message?.includes("demand") ||
+                                     error?.message?.includes("unavailable") ||
+                                     error?.message?.includes("temporary");
+
+      if (isTransientOrQuotaError) {
+        console.warn("Gemini Chat API: Quota/Rate Limit/Temporary Service issue. Using smart offline fallback. Details:", error?.message || error);
+      } else {
+        console.warn("Gemini Chat API Warning (caught & handled):", error?.message || error);
+      }
+
+      // Generate a context-aware smart fallback response based on user keywords
+      const lastUserMsg = (req.body.messages || [])
+        .slice()
+        .reverse()
+        .find((m: any) => m.role === "user")?.content?.toLowerCase() || "";
+
+      let fallbackText = "I am VitalCare's AI Companion. The assistant is currently in light offline mode, but remember: drinking water, eating fresh vegetables, and getting daily rest is excellent for your wellness! If you are feeling unwell, don't hesitate to reach out to your caretaker or tap the Emergency Card.";
+
+      if (lastUserMsg.includes("sugar") || lastUserMsg.includes("diabet") || lastUserMsg.includes("glucose")) {
+        fallbackText = "As your VitalCare Assistant (Offline mode), keeping a check on your sugar levels is super important! Eating fiber-rich food and staying active helps manage diabetes. Remember to discuss your recent levels with your doctor.";
+      } else if (lastUserMsg.includes("pressure") || lastUserMsg.includes("bp") || lastUserMsg.includes("hypertension")) {
+        fallbackText = "As your VitalCare Assistant (Offline mode), we want to make sure your heart is happy! Reducing salty food, breathing deeply, and getting gentle rest can help lower blood pressure. Please consult your physician.";
+      } else if (lastUserMsg.includes("oxygen") || lastUserMsg.includes("pulse") || lastUserMsg.includes("o2")) {
+        fallbackText = "As your VitalCare Assistant (Offline mode), normal oxygen levels are usually above 95%. Taking slow, deep breaths in a well-ventilated space is helpful. Let us know immediately if you feel breathless.";
+      } else if (lastUserMsg.includes("temp") || lastUserMsg.includes("fever") || lastUserMsg.includes("warm")) {
+        fallbackText = "As your VitalCare Assistant (Offline mode), body temperatures around 98.6°F are standard. If you have a mild fever, drink lots of water, rest, and keep the room cool. If it stays high, reach out to your doctor.";
+      }
+
       res.json({
-        text: "I am having trouble connecting to my brain right now! But remember: drink water, eat fresh food, and rest if you feel tired. If you feel very sick, tap the emergency red card to alert your caretaker.",
+        text: fallbackText,
         isFallback: true
       });
     }
@@ -102,7 +148,7 @@ Instructions:
 - Output ONLY the translated content in the requested language (${language}).`;
 
       const response = await client.models.generateContent({
-        model: "gemini-2.5-flash",
+        model: "gemini-3.5-flash",
         contents: prompt,
         config: {
           temperature: 0.3,
@@ -111,7 +157,23 @@ Instructions:
 
       res.json({ text: response.text || fallbackText });
     } catch (error: any) {
-      console.error("Gemini Insights API Error:", error);
+      const isTransientOrQuotaError = error?.status === "RESOURCE_EXHAUSTED" || 
+                                     error?.status === "UNAVAILABLE" ||
+                                     error?.code === 429 || 
+                                     error?.code === 503 ||
+                                     error?.message?.includes("quota") || 
+                                     error?.message?.includes("limit") ||
+                                     error?.message?.includes("exhausted") ||
+                                     error?.message?.includes("demand") ||
+                                     error?.message?.includes("unavailable") ||
+                                     error?.message?.includes("temporary");
+
+      if (isTransientOrQuotaError) {
+        console.warn("Gemini Insights API: Quota/Rate Limit/Temporary Service issue. Using static translated fallback. Details:", error?.message || error);
+      } else {
+        console.warn("Gemini Insights API Warning (caught & handled):", error?.message || error);
+      }
+
       res.json({
         text: fallbackText,
         isFallback: true

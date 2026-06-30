@@ -1,0 +1,50 @@
+{
+  "entities": {
+    "Notification": {
+      "title": "Notification",
+      "description": "An in-app notification delivered to a patient, caretaker, or doctor",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "description": "Unique notification ID"
+        },
+        "recipient_id": {
+          "type": "string",
+          "description": "UID of the user receiving the notification"
+        },
+        "recipient_role": {
+          "type": "string",
+          "description": "Role of the recipient (patient, caretaker, or doctor)"
+        },
+        "type": {
+          "type": "string",
+          "description": "Type of notification (emergency, appointment, caretaker_invite, vitals_log, alert, doctor_update)"
+        },
+        "message": {
+          "type": "string",
+          "description": "Plain-language, short message"
+        },
+        "related_id": {
+          "type": "string",
+          "description": "Optional ID of a related document (e.g., appointment, alert)"
+        },
+        "read": {
+          "type": "boolean",
+          "description": "Whether the notification has been read"
+        },
+        "created_at": {
+          "type": "string",
+          "description": "ISO-8601 creation timestamp string"
+        }
+      },
+      "required": ["recipient_id", "recipient_role", "type", "message", "read", "created_at"]
+    }
+  },
+  "firestore": {
+    "/notifications/{notificationId}": {
+      "schema": "Notification",
+      "description": "In-app notifications collection"
+    }
+  }
+}

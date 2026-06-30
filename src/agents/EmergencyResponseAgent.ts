@@ -201,6 +201,48 @@ export class EmergencyResponseAgent implements Agent {
       handleFirestoreError(err, OperationType.WRITE, "emergency_events");
     }
 
+    // Write real-time notifications for patient, caretakers, and doctors
+    try {
+      // Patient notification
+      await addDoc(collection(db, "notifications"), {
+        recipient_id: patientId,
+        recipient_role: "patient",
+        type: "emergency",
+        message: `🚨 Emergency alarm triggered: ${triggerReason}. Help is on the way!`,
+        related_id: alertRef.id,
+        read: false,
+        created_at: new Date().toISOString()
+      });
+
+      // Caretakers notification
+      for (const caretaker of caretakers) {
+        await addDoc(collection(db, "notifications"), {
+          recipient_id: caretaker.id,
+          recipient_role: "caretaker",
+          type: "emergency",
+          message: `🚨 EMERGENCY: ${patientName} triggered an emergency! Reason: ${triggerReason}. Doctors notified: ${doctors.map(d => d.name).join(", ") || "None"}.`,
+          related_id: alertRef.id,
+          read: false,
+          created_at: new Date().toISOString()
+        });
+      }
+
+      // Doctors notification
+      for (const docObj of doctors) {
+        await addDoc(collection(db, "notifications"), {
+          recipient_id: docObj.id,
+          recipient_role: "doctor",
+          type: "emergency",
+          message: `🚨 EMERGENCY: Patient ${patientName} triggered an emergency! Reason: ${triggerReason}. Caretakers notified: ${caretakers.map(c => c.name).join(", ") || "None"}.`,
+          related_id: alertRef.id,
+          read: false,
+          created_at: new Date().toISOString()
+        });
+      }
+    } catch (err) {
+      console.error("[EmergencyResponseAgent] Error creating real-time notifications:", err);
+    }
+
     // 5. If stayed unresolved after escalation window, escalate by re-notifying
     setTimeout(async () => {
       try {
@@ -244,6 +286,31 @@ export class EmergencyResponseAgent implements Agent {
               escalated_at: new Date().toISOString(),
               status: "escalated_unresolved"
             });
+
+            // Escalation notifications for caretakers and doctors
+            for (const caretaker of caretakers) {
+              await addDoc(collection(db, "notifications"), {
+                recipient_id: caretaker.id,
+                recipient_role: "caretaker",
+                type: "emergency",
+                message: `🚨 ESCALATED EMERGENCY: ${patientName} is still unresolved! Immediate action needed.`,
+                related_id: alertRef.id,
+                read: false,
+                created_at: new Date().toISOString()
+              });
+            }
+
+            for (const docObj of doctors) {
+              await addDoc(collection(db, "notifications"), {
+                recipient_id: docObj.id,
+                recipient_role: "doctor",
+                type: "emergency",
+                message: `🚨 ESCALATED EMERGENCY: Patient ${patientName} is still unresolved! Immediate action needed.`,
+                related_id: alertRef.id,
+                read: false,
+                created_at: new Date().toISOString()
+              });
+            }
           } catch (err) {
             handleFirestoreError(err, OperationType.WRITE, `emergency_events/${emergencyDocRef.id}`);
           }

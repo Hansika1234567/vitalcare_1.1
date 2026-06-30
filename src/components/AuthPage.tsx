@@ -129,7 +129,7 @@ export default function AuthPage({ onAuthSuccess }: AuthPageProps) {
         }
       }
     } catch (err: any) {
-      console.error(err);
+      console.warn("Handled authentication warning:", err?.message || err);
       let friendlyMessage = err.message;
       if (err.code === "auth/email-already-in-use") {
         friendlyMessage = "This email is already registered. Please sign in instead.";
@@ -141,11 +141,65 @@ export default function AuthPage({ onAuthSuccess }: AuthPageProps) {
         friendlyMessage = "Incorrect email or password. Please try again.";
       } else if (err.code === "auth/operation-not-allowed" || err.message?.includes("operation-not-allowed")) {
         friendlyMessage = "Firebase Authentication error: Email/Password sign-in provider is disabled in your Firebase console. Please go to the Firebase Console -> Authentication -> Sign-in method, and enable 'Email/Password' to register or sign in.";
+      } else if (err.code === "auth/network-request-failed" || err.message?.includes("network-request-failed") || err.message?.includes("network")) {
+        friendlyMessage = "Network Request Failed: Unable to connect to Firebase Authentication. This typically occurs when third-party cookies or scripts are blocked by your browser's private/incognito mode or ad blockers in this preview iframe. You can use the Quick Demo Login below to evaluate the app immediately without Firebase servers!";
       }
       setError(friendlyMessage);
     } finally {
       setLoading(false);
     }
+  };
+
+  const handleDemoLogin = (selectedRole: UserRole) => {
+    let demoProfile: UserProfile;
+    
+    if (selectedRole === "patient") {
+      demoProfile = {
+        uid: "demo-patient-123",
+        fullName: "Ramesh Kumar (Demo Patient)",
+        email: "ramesh.demo@vitalcare.org",
+        role: "patient",
+        phoneNumber: "+91 98765 43210",
+        emergencyName: "Sita Kumar",
+        emergencyPhone: "+91 98765 43211",
+        emergencyRelationship: "Spouse",
+        age: 45,
+        gender: "male",
+        bloodGroup: "O+",
+        state: "Andhra Pradesh",
+        medicalHistory: "Type 2 diabetes managed with diet, occasional mild asthma.",
+        createdAt: new Date().toISOString()
+      };
+    } else if (selectedRole === "caretaker") {
+      demoProfile = {
+        uid: "demo-caretaker-456",
+        fullName: "Sita Kumar (Demo Caretaker)",
+        email: "sita.demo@vitalcare.org",
+        role: "caretaker",
+        phoneNumber: "+91 98765 43211",
+        createdAt: new Date().toISOString()
+      };
+    } else if (selectedRole === "doctor") {
+      demoProfile = {
+        uid: "demo-doctor-789",
+        fullName: "Dr. Anjali Sharma (Demo Doctor)",
+        email: "anjali.demo@vitalcare.org",
+        role: "doctor",
+        phoneNumber: "+91 98765 43212",
+        specialization: "General Physician & Family Health Care",
+        createdAt: new Date().toISOString()
+      };
+    } else {
+      demoProfile = {
+        uid: "demo-admin-999",
+        fullName: "System Admin (Demo)",
+        email: "admin.demo@vitalcare.org",
+        role: "admin",
+        createdAt: new Date().toISOString()
+      };
+    }
+    
+    onAuthSuccess(demoProfile);
   };
 
   return (
@@ -378,7 +432,7 @@ export default function AuthPage({ onAuthSuccess }: AuthPageProps) {
                   Optional Health Details
                 </h3>
 
-                <div className="grid grid-cols-3 gap-2">
+                <div className="grid grid-cols-1 gap-3 sm:grid-cols-3">
                   <div>
                     <label htmlFor="age" className="block text-xs font-semibold text-slate-600 mb-1">
                       Age
@@ -492,7 +546,7 @@ export default function AuthPage({ onAuthSuccess }: AuthPageProps) {
             <button
               type="submit"
               disabled={loading}
-              className="mt-4 w-full flex justify-center items-center py-3 px-4 border border-transparent rounded-xl shadow-md text-sm font-bold text-white bg-rose-500 hover:bg-rose-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-rose-500 transition-colors disabled:opacity-50"
+              className="mt-4 w-full flex justify-center items-center py-3 px-4 border border-transparent rounded-xl shadow-md text-sm font-bold text-white bg-rose-500 hover:bg-rose-600 focus:outline-none focus:ring-2 focus:ring-offset-2 focus:ring-rose-500 transition-colors disabled:opacity-50 cursor-pointer"
             >
               {loading ? (
                 <span className="flex items-center gap-2">
@@ -506,6 +560,52 @@ export default function AuthPage({ onAuthSuccess }: AuthPageProps) {
               )}
             </button>
           </form>
+
+          {/* Quick Demo Login Option */}
+          <div className="mt-6 pt-6 border-t border-slate-100">
+            <div className="relative flex justify-center text-sm mb-4">
+              <span className="px-3 bg-white text-xs font-black uppercase tracking-wider text-slate-400">
+                Or Fast Evaluation (No-Auth Sandbox)
+              </span>
+            </div>
+            <p className="text-[11px] text-slate-500 text-center mb-3 leading-relaxed">
+              Skip registration and evaluate specific dashboards locally. Great if experiencing network blocks or third-party cookie restrictions:
+            </p>
+            <div className="grid grid-cols-2 gap-2">
+              <button
+                type="button"
+                onClick={() => handleDemoLogin("patient")}
+                className="py-2.5 px-3 bg-rose-50 hover:bg-rose-100 border border-rose-100 text-rose-700 rounded-xl text-xs font-bold transition-all hover:-translate-y-0.5 active:translate-y-0 flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
+              >
+                <User className="h-4 w-4 shrink-0" />
+                As Patient
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDemoLogin("caretaker")}
+                className="py-2.5 px-3 bg-emerald-50 hover:bg-emerald-100 border border-emerald-100 text-emerald-700 rounded-xl text-xs font-bold transition-all hover:-translate-y-0.5 active:translate-y-0 flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
+              >
+                <Activity className="h-4 w-4 shrink-0" />
+                As Caretaker
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDemoLogin("doctor")}
+                className="py-2.5 px-3 bg-indigo-50 hover:bg-indigo-100 border border-indigo-100 text-indigo-700 rounded-xl text-xs font-bold transition-all hover:-translate-y-0.5 active:translate-y-0 flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
+              >
+                <Award className="h-4 w-4 shrink-0" />
+                As Doctor
+              </button>
+              <button
+                type="button"
+                onClick={() => handleDemoLogin("admin")}
+                className="py-2.5 px-3 bg-slate-100 hover:bg-slate-200 border border-slate-200 text-slate-700 rounded-xl text-xs font-bold transition-all hover:-translate-y-0.5 active:translate-y-0 flex items-center justify-center gap-1.5 cursor-pointer shadow-sm"
+              >
+                <Shield className="h-4 w-4 shrink-0" />
+                As Admin (System)
+              </button>
+            </div>
+          </div>
         </div>
       </div>
     </div>

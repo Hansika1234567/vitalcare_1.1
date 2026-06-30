@@ -205,7 +205,7 @@ export default function AdminDashboard({ profile, onLogout }: AdminDashboardProp
         </div>
 
         {/* Grid of charts and metrics */}
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-6">
 
           {/* User Role Analytics (PieChart) */}
           <div className="bg-white border border-slate-200 rounded-3xl p-6 shadow-md">

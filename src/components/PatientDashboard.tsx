@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import { 
   db, 
   collection, 
@@ -15,7 +15,8 @@ import {
   deleteDoc,
   limit,
   handleFirestoreError,
-  OperationType
+  OperationType,
+  updateDoc
 } from "../firebase";
 import { 
   UserProfile, 
@@ -53,6 +54,10 @@ import {
   Droplet, 
   MapPin, 
   Send, 
+  Paperclip,
+  Mic,
+  MicOff,
+  Image,
   X, 
   BookOpen, 
   LogOut, 
@@ -63,7 +68,11 @@ import {
   ChevronRight,
   Navigation,
   Map,
-  Hospital as HospitalIcon
+  Hospital as HospitalIcon,
+  Bell,
+  CheckCheck,
+  Calendar,
+  UserCheck
 } from "lucide-react";
 
 function evaluateSchemeEligibility(scheme: GovernmentScheme, profile: UserProfile): {
@@ -355,6 +364,100 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
 
   // Real-time states
   const [vitals, setVitals] = useState<VitalsRecord[]>([]);
+  
+  // Real-time notifications states
+  const [notifications, setNotifications] = useState<any[]>([]);
+  const [toasts, setToasts] = useState<any[]>([]);
+  const [showBellDropdown, setShowBellDropdown] = useState(false);
+
+  // Audio tone generator
+  const playNotificationSound = (isEmergency = false) => {
+    try {
+      const AudioContext = window.AudioContext || (window as any).webkitAudioContext;
+      if (!AudioContext) return;
+      const ctx = new AudioContext();
+      const osc = ctx.createOscillator();
+      const gain = ctx.createGain();
+      
+      osc.connect(gain);
+      gain.connect(ctx.destination);
+      
+      if (isEmergency) {
+        osc.type = "sawtooth";
+        osc.frequency.setValueAtTime(880, ctx.currentTime);
+        gain.gain.setValueAtTime(0.15, ctx.currentTime);
+        osc.start();
+        osc.frequency.linearRampToValueAtTime(1100, ctx.currentTime + 0.15);
+        osc.frequency.linearRampToValueAtTime(880, ctx.currentTime + 0.3);
+        gain.gain.setValueAtTime(0.15, ctx.currentTime + 0.15);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.5);
+        osc.stop(ctx.currentTime + 0.5);
+      } else {
+        osc.type = "sine";
+        osc.frequency.setValueAtTime(587.33, ctx.currentTime);
+        gain.gain.setValueAtTime(0.1, ctx.currentTime);
+        osc.start();
+        osc.frequency.setValueAtTime(880, ctx.currentTime + 0.1);
+        gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+        osc.stop(ctx.currentTime + 0.4);
+      }
+    } catch (err) {
+      console.warn("Audio playback blocked or failed:", err);
+    }
+  };
+
+  const handleMarkAsRead = async (id: string) => {
+    try {
+      await updateDoc(doc(db, "notifications", id), { read: true });
+    } catch (err) {
+      console.error("Error marking notification as read:", err);
+    }
+  };
+
+  const handleMarkAllAsRead = async () => {
+    try {
+      const unread = notifications.filter(n => !n.read);
+      for (const n of unread) {
+        await updateDoc(doc(db, "notifications", n.id), { read: true });
+      }
+    } catch (err) {
+      console.error("Error marking all notifications as read:", err);
+    }
+  };
+
+  const getNotificationIcon = (type: string) => {
+    switch (type) {
+      case "emergency":
+        return <AlertTriangle className="h-4 w-4 text-rose-600 animate-pulse" />;
+      case "appointment":
+        return <Calendar className="h-4 w-4 text-emerald-600" />;
+      case "caretaker_invite":
+        return <UserCheck className="h-4 w-4 text-indigo-600" />;
+      case "vitals_log":
+        return <Heart className="h-4 w-4 text-sky-600 animate-pulse" />;
+      case "alert":
+        return <Bell className="h-4 w-4 text-amber-500" />;
+      case "doctor_update":
+        return <FileText className="h-4 w-4 text-rose-500" />;
+      default:
+        return <Bell className="h-4 w-4 text-slate-500" />;
+    }
+  };
+
+  useEffect(() => {
+    const routineToasts = toasts.filter(t => !t.is_emergency);
+    if (routineToasts.length === 0) return;
+    const timer = setTimeout(() => {
+      setToasts(prev => {
+        const oldestRoutine = prev.find(t => !t.is_emergency);
+        if (oldestRoutine) {
+          return prev.filter(t => t.id !== oldestRoutine.id);
+        }
+        return prev;
+      });
+    }, 6000);
+    return () => clearTimeout(timer);
+  }, [toasts]);
   const [caretakers, setCaretakers] = useState<PatientCaretaker[]>([]);
   const [doctors, setDoctors] = useState<PatientDoctor[]>([]);
   const [allDoctorsList, setAllDoctorsList] = useState<UserProfile[]>([]);
@@ -391,6 +494,12 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
   const [bookingLoading, setBookingLoading] = useState(false);
   const [bookingStatus, setBookingStatus] = useState("");
 
+  // Doctor browsing/filter/detail states
+  const [doctorFilterSpecialization, setDoctorFilterSpecialization] = useState("");
+  const [doctorSortBy, setDoctorSortBy] = useState("rating"); // default sort by rating
+  const [doctorSearchQuery, setDoctorSearchQuery] = useState("");
+  const [selectedDoctorForDetail, setSelectedDoctorForDetail] = useState<UserProfile | null>(null);
+
   // Blood fields
   const [bloodType, setBloodType] = useState<"donor" | "request">("request");
   const [bloodGroup, setBloodGroup] = useState("O+");
@@ -401,10 +510,24 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
 
   // AI assistant chat state
   const [chatInput, setChatInput] = useState("");
-  const [chatMessages, setChatMessages] = useState<{ role: string; content: string }[]>([
+  const [chatMessages, setChatMessages] = useState<{ 
+    role: string; 
+    content: string; 
+    attachment?: { name: string; mimeType: string; data: string } 
+  }[]>([
     { role: "assistant", content: "Hello! I am your VitalCare AI companion. How can I help you today? Ask me any questions about healthy eating, drinking water, or exercising." }
   ]);
   const [chatLoading, setChatLoading] = useState(false);
+
+  // Chat attachment and voice recording states
+  const [chatAttachment, setChatAttachment] = useState<{ name: string; mimeType: string; data: string } | null>(null);
+  const [isListening, setIsListening] = useState(false);
+  const [isRecordingAudio, setIsRecordingAudio] = useState(false);
+  const [speechError, setSpeechError] = useState<string | null>(null);
+  const recognitionRef = useRef<any>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Gemini automatic health insights state
   const [aiInsights, setAiInsights] = useState("");
@@ -516,6 +639,44 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
       console.warn("Agent logs subscription failed:", err);
     });
 
+    // 9. Subscribe to real-time notifications
+    const notificationsQ = query(
+      collection(db, "notifications"),
+      where("recipient_id", "==", profile.uid),
+      orderBy("created_at", "desc"),
+      limit(50)
+    );
+    let isInitialLoad = true;
+    const unsubNotifications = onSnapshot(notificationsQ, (snap) => {
+      const records = snap.docs.map(doc => ({ id: doc.id, ...doc.data() })) as any[];
+      setNotifications(records);
+
+      if (!isInitialLoad) {
+        snap.docChanges().forEach((change) => {
+          if (change.type === "added") {
+            const data = change.doc.data();
+            if (!data.read) {
+              const isEmergency = data.type === "emergency";
+              setToasts(prev => [
+                ...prev,
+                {
+                  id: change.doc.id,
+                  type: data.type,
+                  message: data.message,
+                  created_at: data.created_at,
+                  is_emergency: isEmergency
+                }
+              ]);
+              playNotificationSound(isEmergency);
+            }
+          }
+        });
+      }
+      isInitialLoad = false;
+    }, (err) => {
+      console.warn("Notifications subscription failed:", err);
+    });
+
     // Load static modules
     loadDoctors();
     loadSchemes();
@@ -530,12 +691,133 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
       unsubBlood();
       unsubInsights();
       unsubLogs();
+      unsubNotifications();
     };
+  }, [profile.uid]);
+
+  // Auto-prompt logging of vitals on login / first load of the session
+  useEffect(() => {
+    if (!profile.uid) return;
+    const sessionKey = `vitals_prompted_${profile.uid}`;
+    const hasPrompted = sessionStorage.getItem(sessionKey);
+    if (!hasPrompted) {
+      setShowLogModal(true);
+      sessionStorage.setItem(sessionKey, "true");
+    }
   }, [profile.uid]);
 
   // Load static resources
   const loadDoctors = async () => {
     try {
+      // First, get the current list of hospitals in the database
+      const hospSnap = await getDocs(collection(db, "hospitals"));
+      const dbHospitals = hospSnap.docs.map(d => ({ id: d.id, ...d.data() })) as Hospital[];
+
+      const seedDoctorsList = [
+        {
+          uid: "seed_doc_arvind",
+          fullName: "Arvind Kumar",
+          email: "arvind.kumar@vitalcare.com",
+          role: "doctor",
+          phoneNumber: "+91 98765 43210",
+          specialization: "Heart Care",
+          qualification: "MBBS, MD, DM (Cardiology)",
+          experience: 16,
+          hospitalName: "Apollo General & Cardiac Center",
+          consultationFee: 800,
+          languages: ["English", "Hindi", "Telugu"],
+          availableDays: ["Mon", "Tue", "Wed", "Thu", "Fri"],
+          availableTime: "09:00 AM - 01:00 PM",
+          rating: 4.9,
+          bio: "Dr. Arvind Kumar is a renowned cardiologist with over 16 years of experience. He is dedicated to providing comprehensive cardiovascular care, including preventive cardiology and advanced interventional procedures.",
+          createdAt: new Date().toISOString()
+        },
+        {
+          uid: "seed_doc_sarah",
+          fullName: "Sarah D'Souza",
+          email: "sarah.dsouza@vitalcare.com",
+          role: "doctor",
+          phoneNumber: "+91 98123 45678",
+          specialization: "Pediatrics",
+          qualification: "MBBS, MD (Pediatrics), DCH",
+          experience: 12,
+          hospitalName: "NIMS Government Medical Institute",
+          consultationFee: 400,
+          languages: ["English", "Hindi", "Konkani"],
+          availableDays: ["Mon", "Wed", "Fri"],
+          availableTime: "10:00 AM - 04:00 PM",
+          rating: 4.8,
+          bio: "Dr. Sarah D'Souza has over 12 years of experience caring for children of all ages. She focuses on early child development, immunization programs, and pediatric emergency management.",
+          createdAt: new Date().toISOString()
+        },
+        {
+          uid: "seed_doc_amit",
+          fullName: "Amit Patel",
+          email: "amit.patel@vitalcare.com",
+          role: "doctor",
+          phoneNumber: "+91 91234 56789",
+          specialization: "Brain Care",
+          qualification: "MBBS, MCh (Neurosurgery)",
+          experience: 18,
+          hospitalName: "Medicover Multi-Specialty Hospital",
+          consultationFee: 1000,
+          languages: ["English", "Hindi", "Gujarati"],
+          availableDays: ["Tue", "Thu", "Sat"],
+          availableTime: "11:00 AM - 05:00 PM",
+          rating: 4.95,
+          bio: "Dr. Amit Patel is a senior neurosurgeon with 18+ years of expertise. He is recognized for his clinical excellence in brain tumor surgeries, spinal disorders, and neuro-critical care.",
+          createdAt: new Date().toISOString()
+        },
+        {
+          uid: "seed_doc_priya",
+          fullName: "Priya Sharma",
+          email: "priya.sharma@vitalcare.com",
+          role: "doctor",
+          phoneNumber: "+91 99887 76655",
+          specialization: "General Care",
+          qualification: "MBBS, MD (General Medicine)",
+          experience: 10,
+          hospitalName: "Care Hospitals",
+          consultationFee: 500,
+          languages: ["English", "Hindi", "Punjabi"],
+          availableDays: ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat"],
+          availableTime: "08:00 AM - 02:00 PM",
+          rating: 4.7,
+          bio: "Dr. Priya Sharma is a compassionate general physician specializing in chronic disease management, diabetes control, and comprehensive family health checks.",
+          createdAt: new Date().toISOString()
+        },
+        {
+          uid: "seed_doc_rajesh",
+          fullName: "Rajesh Gupta",
+          email: "rajesh.gupta@vitalcare.com",
+          role: "doctor",
+          phoneNumber: "+91 94433 22110",
+          specialization: "Orthopedics",
+          qualification: "MBBS, MS (Orthopedics)",
+          experience: 14,
+          hospitalName: "Continental Hospitals",
+          consultationFee: 700,
+          languages: ["English", "Hindi", "Telugu"],
+          availableDays: ["Mon", "Tue", "Thu", "Fri"],
+          availableTime: "02:00 PM - 06:00 PM",
+          rating: 4.85,
+          bio: "Dr. Rajesh Gupta is a veteran orthopedic surgeon specializing in joint replacements, sports injuries, and complex trauma management.",
+          createdAt: new Date().toISOString()
+        }
+      ];
+
+      // Write or merge seeded doctors with matching hospital links
+      for (const d of seedDoctorsList) {
+        const matchedHosp = dbHospitals.find(h => h.name.toLowerCase() === d.hospitalName.toLowerCase());
+        const hospital_id = matchedHosp ? matchedHosp.id : "";
+
+        await setDoc(doc(db, "users", d.uid), {
+          ...d,
+          hospital_id: hospital_id || ""
+        }, { merge: true });
+      }
+
+      // Query all doctors in the system
       const snap = await getDocs(query(collection(db, "users"), where("role", "==", "doctor")));
       const docs = snap.docs.map(d => d.data() as UserProfile);
       setAllDoctorsList(docs);
@@ -816,7 +1098,7 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
       const data = await res.json();
       setAiInsights(data.text);
     } catch (e) {
-      console.error("AI Insights Error", e);
+      console.warn("AI Insights (handled):", e);
       setAiInsights(t.lowRisk);
     } finally {
       setInsightsLoading(false);
@@ -851,6 +1133,30 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
       await addDoc(collection(db, "vitals"), newRecord);
       setShowLogModal(false);
 
+      // Trigger real-time notifications to all linked accepted caretakers
+      try {
+        const caretakersQuery = query(
+          collection(db, "patient_caretaker"),
+          where("patient_id", "==", profile.uid),
+          where("status", "==", "accepted")
+        );
+        const caretakersSnap = await getDocs(caretakersQuery);
+        for (const ctDoc of caretakersSnap.docs) {
+          const ct = ctDoc.data();
+          await addDoc(collection(db, "notifications"), {
+            recipient_id: ct.caretaker_id,
+            recipient_role: "caretaker",
+            type: "vitals_log",
+            message: `📊 Patient ${profile.fullName} logged new vitals (Risk: ${risk.toUpperCase()}). HR: ${heartRate} bpm, BP: ${systolic}/${diastolic}, O2: ${oxygenLevel}%, Temp: ${temperature}°C`,
+            related_id: profile.uid,
+            read: false,
+            created_at: new Date().toISOString()
+          });
+        }
+      } catch (err) {
+        console.error("Error creating caretaker vitals logged notification:", err);
+      }
+
       // Trigger the AI Agents Layer!
       await agentManager.dispatchEvent({
         type: "VITALS_UPDATED",
@@ -872,7 +1178,7 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
       // If it's high, HealthMonitoringAgent will trigger RISK_LEVEL_CRITICAL and EmergencyResponseAgent will log/alert
       if (risk === "medium") {
         const message = `Alert: Vitals are outside normal parameters. Please check-in and rest.`;
-        await addDoc(collection(db, "alerts"), {
+        const alertRef = await addDoc(collection(db, "alerts"), {
           patient_id: profile.uid,
           patient_name: profile.fullName,
           type: oxygenLevel < 92 ? "oxygen" : systolic > 135 ? "blood_pressure" : "heart_rate",
@@ -880,6 +1186,17 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
           message,
           timestamp: new Date().toISOString(),
           resolved: false
+        });
+
+        // Notify patient of their alert
+        await addDoc(collection(db, "notifications"), {
+          recipient_id: profile.uid,
+          recipient_role: "patient",
+          type: "alert",
+          message: `⚠️ Vitals Alert: ${message}`,
+          related_id: alertRef.id,
+          read: false,
+          created_at: new Date().toISOString()
         });
       }
     } catch (e) {
@@ -1011,6 +1328,36 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
     }
   };
 
+  // Request Direct Doctor Link
+  const handleRequestDoctorLink = async (doctor: UserProfile) => {
+    try {
+      const relationId = `${profile.uid}_${doctor.uid}`;
+      await setDoc(doc(db, "patient_doctor", relationId), {
+        id: relationId,
+        patient_id: profile.uid,
+        patient_name: profile.fullName,
+        doctor_id: doctor.uid,
+        doctor_name: doctor.fullName,
+        status: "pending",
+        assigned_date: new Date().toISOString()
+      });
+    } catch (err) {
+      console.error("Error requesting doctor link:", err);
+    }
+  };
+
+  // Remove/Cancel Doctor Link
+  const handleRemoveDoctorLink = async (doctorId: string) => {
+    try {
+      const relationId = `${profile.uid}_${doctorId}`;
+      await updateDoc(doc(db, "patient_doctor", relationId), {
+        status: "inactive"
+      });
+    } catch (err) {
+      console.error("Error removing doctor link:", err);
+    }
+  };
+
   // Submit Blood request or donation
   const handleBloodSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -1039,14 +1386,167 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
     }
   };
 
+  // File upload handler
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = () => {
+      const base64Data = (reader.result as string).split(",")[1];
+      setChatAttachment({
+        name: file.name,
+        mimeType: file.type,
+        data: base64Data,
+      });
+    };
+    reader.readAsDataURL(file);
+    e.target.value = "";
+  };
+
+  // Real-time voice transcription (Voice Dictation)
+  const startListening = () => {
+    const SpeechRecognition = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      setSpeechError("Speech recognition is not supported in this browser. Please try Chrome, Edge, or Safari.");
+      setTimeout(() => setSpeechError(null), 8000);
+      return;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.continuous = false;
+    recognition.interimResults = false;
+    recognition.lang = lang === "hi" ? "hi-IN" : lang === "te" ? "te-IN" : "en-US";
+
+    recognition.onstart = () => {
+      setIsListening(true);
+      setSpeechError(null);
+    };
+
+    recognition.onresult = (event: any) => {
+      const transcript = event.results[0][0].transcript;
+      if (transcript) {
+        setChatInput(prev => prev ? `${prev} ${transcript}` : transcript);
+      }
+    };
+
+    recognition.onerror = (event: any) => {
+      console.error("Speech recognition error:", event);
+      let errorMsg = "Speech recognition error. Please check your microphone connection.";
+      if (event.error === "not-allowed") {
+        errorMsg = "Microphone access is blocked. Please allow microphone permission in your browser.";
+      } else if (event.error === "no-speech") {
+        errorMsg = "No speech detected. Please speak clearly into your microphone.";
+      } else if (event.error === "service-not-allowed") {
+        errorMsg = "Speech recognition service is blocked or not allowed by your OS/Browser.";
+      }
+      setSpeechError(errorMsg);
+      setIsListening(false);
+      setTimeout(() => setSpeechError(null), 8000);
+    };
+
+    recognition.onend = () => {
+      setIsListening(false);
+    };
+
+    recognitionRef.current = recognition;
+    try {
+      recognition.start();
+    } catch (e: any) {
+      console.error("Failed to start speech recognition:", e);
+      setSpeechError("Failed to start speech recognition. Please make sure no other app is using your microphone.");
+      setIsListening(false);
+      setTimeout(() => setSpeechError(null), 8000);
+    }
+  };
+
+  const stopListening = () => {
+    if (recognitionRef.current) {
+      recognitionRef.current.stop();
+    }
+    setIsListening(false);
+  };
+
+  const toggleListening = () => {
+    if (isListening) {
+      stopListening();
+    } else {
+      startListening();
+    }
+  };
+
+  // Audio voice note recorder (recording voice file)
+  const startRecordingAudio = async () => {
+    try {
+      setSpeechError(null);
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      audioChunksRef.current = [];
+      const mediaRecorder = new MediaRecorder(stream);
+      
+      mediaRecorder.ondataavailable = (event) => {
+        if (event.data.size > 0) {
+          audioChunksRef.current.push(event.data);
+        }
+      };
+
+      mediaRecorder.onstop = () => {
+        const audioBlob = new Blob(audioChunksRef.current, { type: "audio/webm" });
+        const reader = new FileReader();
+        reader.onload = () => {
+          const base64Data = (reader.result as string).split(",")[1];
+          setChatAttachment({
+            name: `voice_note_${Date.now()}.webm`,
+            mimeType: "audio/webm",
+            data: base64Data,
+          });
+        };
+        reader.readAsDataURL(audioBlob);
+        
+        // Stop microphone
+        stream.getTracks().forEach(track => track.stop());
+      };
+
+      mediaRecorderRef.current = mediaRecorder;
+      mediaRecorder.start();
+      setIsRecordingAudio(true);
+    } catch (err: any) {
+      console.error("Failed to start recording audio:", err);
+      let errorMsg = "Could not access microphone. Please check your browser permissions.";
+      if (err.name === "NotAllowedError" || err.message?.includes("Permission denied")) {
+        errorMsg = "Microphone access is blocked. Please allow microphone permission in your browser settings.";
+      }
+      setSpeechError(errorMsg);
+      setTimeout(() => setSpeechError(null), 8000);
+    }
+  };
+
+  const stopRecordingAudio = () => {
+    if (mediaRecorderRef.current && isRecordingAudio) {
+      mediaRecorderRef.current.stop();
+      setIsRecordingAudio(false);
+    }
+  };
+
   // Ask Gemini Assistant Chat
   const handleSendChatMessage = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!chatInput.trim()) return;
+    if (!chatInput.trim() && !chatAttachment) return;
 
-    const userMsg = chatInput;
+    const userMsg = chatInput.trim();
+    const currentAttachment = chatAttachment;
+
+    // Clear form inputs immediately
     setChatInput("");
-    setChatMessages(prev => [...prev, { role: "user", content: userMsg }]);
+    setChatAttachment(null);
+
+    // Build user message with optional attachment
+    const newUserMsg = {
+      role: "user",
+      content: userMsg || (currentAttachment ? `Sent a file: ${currentAttachment.name}` : ""),
+      ...(currentAttachment ? { attachment: currentAttachment } : {})
+    };
+
+    setChatMessages(prev => [...prev, newUserMsg]);
     setChatLoading(true);
 
     try {
@@ -1055,14 +1555,14 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ 
-          messages: [...chatMessages, { role: "user", content: userMsg }] 
+          messages: [...chatMessages, newUserMsg] 
         })
       });
 
       const data = await res.json();
       setChatMessages(prev => [...prev, { role: "assistant", content: data.text }]);
     } catch (err) {
-      console.error(err);
+      console.warn("Gemini Chat (handled):", err);
       setChatMessages(prev => [...prev, { 
         role: "assistant", 
         content: "I'm having trouble connecting right now! Make sure you stay calm, rest well, and tell your doctor if you feel very unwell." 
@@ -1106,8 +1606,40 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
       ? baseHospitals.filter((h) => h.specializations.includes(selectedSpecialization))
       : baseHospitals;
 
-    // Sort by distance ascending
-    const sorted = [...filtered].sort((a, b) => a.distance - b.distance);
+    // Identify hospitals where the patient has active/linked doctors
+    const activeDocHospitalLinks = doctors
+      .filter(d => d.status === "active")
+      .map(d => {
+        const docItem = allDoctorsList.find(adm => adm.uid === d.doctor_id);
+        if (!docItem) return null;
+        return {
+          hospitalId: docItem.hospital_id,
+          hospitalName: docItem.hospitalName,
+          docName: docItem.fullName
+        };
+      })
+      .filter((item): item is { hospitalId?: string; hospitalName?: string; docName: string } => !!item);
+
+    // Map hospitals to add active doctors information
+    const hospitalsWithDoctors = filtered.map(h => {
+      const matchedDocs = activeDocHospitalLinks.filter(
+        dh => (dh.hospitalId && h.id && dh.hospitalId === h.id) || 
+              (dh.hospitalName && h.name && dh.hospitalName.toLowerCase() === h.name.toLowerCase())
+      );
+      return {
+        ...h,
+        activeDoctors: matchedDocs.map(dh => dh.docName)
+      };
+    });
+
+    // Sort: hospitals with active doctors go FIRST, and within each group sort by distance ascending
+    const sorted = [...hospitalsWithDoctors].sort((a, b) => {
+      const aHasDoc = a.activeDoctors && a.activeDoctors.length > 0;
+      const bHasDoc = b.activeDoctors && b.activeDoctors.length > 0;
+      if (aHasDoc && !bHasDoc) return -1;
+      if (!aHasDoc && bHasDoc) return 1;
+      return a.distance - b.distance;
+    });
 
     // Return closest 5
     return sorted.slice(0, 5);
@@ -1122,46 +1654,273 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
     })())
   ).sort();
 
+  const filteredAndSortedDoctors = (() => {
+    let filtered = [...allDoctorsList];
+
+    // Filter by Search Query (name, hospital, specialization or bio)
+    if (doctorSearchQuery.trim()) {
+      const q = doctorSearchQuery.toLowerCase();
+      filtered = filtered.filter(d => 
+        d.fullName.toLowerCase().includes(q) || 
+        (d.specialization && d.specialization.toLowerCase().includes(q)) || 
+        (d.hospitalName && d.hospitalName.toLowerCase().includes(q)) ||
+        (d.bio && d.bio.toLowerCase().includes(q))
+      );
+    }
+
+    // Filter by Specialization dropdown
+    if (doctorFilterSpecialization) {
+      filtered = filtered.filter(d => d.specialization === doctorFilterSpecialization);
+    }
+
+    // Sort by selected parameter
+    if (doctorSortBy === "experience") {
+      filtered.sort((a, b) => (b.experience || 0) - (a.experience || 0));
+    } else if (doctorSortBy === "rating") {
+      filtered.sort((a, b) => (b.rating || 0) - (a.rating || 0));
+    } else if (doctorSortBy === "fee") {
+      filtered.sort((a, b) => (a.consultationFee || 0) - (b.consultationFee || 0));
+    }
+
+    return filtered;
+  })();
+
   return (
-    <div className="min-h-screen bg-slate-50 flex flex-col pb-24">
-      {/* Top Banner */}
-      <header className="bg-white border-b border-slate-100 shadow-sm sticky top-0 z-10 px-4 py-3 flex items-center justify-between">
-        <div className="flex items-center gap-2">
-          <div className="bg-rose-500 text-white p-2 rounded-xl">
-            <Heart className="h-6 w-6 fill-white" />
-          </div>
-          <div>
-            <h1 className="text-xl font-extrabold text-slate-900 tracking-tight">VitalCare</h1>
-            <p className="text-xs text-rose-600 font-bold">{t.patientDashboard}</p>
+    <div className="min-h-screen bg-slate-50 flex flex-col lg:flex-row pb-24 lg:pb-0">
+      {/* Desktop Left Sidebar */}
+      <aside className="hidden lg:flex lg:w-64 lg:flex-col bg-slate-900 text-white shrink-0 sticky top-0 h-screen z-20">
+        <div className="p-6 border-b border-slate-800">
+          <div className="flex items-center gap-2">
+            <div className="bg-rose-500 text-white p-2 rounded-xl">
+              <Heart className="h-6 w-6 fill-white" />
+            </div>
+            <div>
+              <h1 className="text-xl font-extrabold tracking-tight">VitalCare</h1>
+              <p className="text-xs text-rose-400 font-bold">{t.patientDashboard}</p>
+            </div>
           </div>
         </div>
 
-        <div className="flex items-center gap-3">
-          {/* Language Selector */}
-          <div className="flex bg-slate-100 p-1 rounded-xl gap-1">
+        {/* User profile brief in sidebar */}
+        <div className="p-4 mx-4 my-4 bg-slate-800/60 rounded-2xl border border-slate-800">
+          <div className="text-xs font-bold text-slate-400">LOGGED IN AS</div>
+          <div className="text-sm font-black text-white truncate">{profile.fullName}</div>
+          <div className="text-[10px] text-slate-400 truncate mt-0.5">{profile.email}</div>
+        </div>
+
+        {/* Desktop Navigation Links */}
+        <nav className="flex-1 px-4 space-y-1.5 overflow-y-auto">
+          <button
+            onClick={() => setActiveTab("vitals")}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl font-black text-xs transition-colors ${
+              activeTab === "vitals" ? "bg-rose-600 text-white" : "text-slate-400 hover:bg-slate-800 hover:text-white"
+            }`}
+          >
+            <Activity className="h-4.5 w-4.5" />
+            <span>{tabNames[lang].vitals}</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab("doctors")}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl font-black text-xs transition-colors ${
+              activeTab === "doctors" ? "bg-rose-600 text-white" : "text-slate-400 hover:bg-slate-800 hover:text-white"
+            }`}
+          >
+            <User className="h-4.5 w-4.5" />
+            <span>{tabNames[lang].doctors}</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab("caretakers")}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl font-black text-xs transition-colors ${
+              activeTab === "caretakers" ? "bg-rose-600 text-white" : "text-slate-400 hover:bg-slate-800 hover:text-white"
+            }`}
+          >
+            <Award className="h-4.5 w-4.5" />
+            <span>{tabNames[lang].family}</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab("schemes")}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl font-black text-xs transition-colors ${
+              activeTab === "schemes" ? "bg-rose-600 text-white" : "text-slate-400 hover:bg-slate-800 hover:text-white"
+            }`}
+          >
+            <BookOpen className="h-4.5 w-4.5" />
+            <span>{tabNames[lang].schemes}</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab("hospitals")}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl font-black text-xs transition-colors ${
+              activeTab === "hospitals" ? "bg-rose-600 text-white" : "text-slate-400 hover:bg-slate-800 hover:text-white"
+            }`}
+          >
+            <HospitalIcon className="h-4.5 w-4.5" />
+            <span>{tabNames[lang].hospitals}</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab("blood")}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl font-black text-xs transition-colors ${
+              activeTab === "blood" ? "bg-rose-600 text-white" : "text-slate-400 hover:bg-slate-800 hover:text-white"
+            }`}
+          >
+            <Droplet className="h-4.5 w-4.5" />
+            <span>{tabNames[lang].blood}</span>
+          </button>
+
+          <button
+            onClick={() => setActiveTab("ai")}
+            className={`w-full flex items-center gap-3 px-4 py-3 rounded-xl font-black text-xs transition-colors ${
+              activeTab === "ai" ? "bg-rose-600 text-white" : "text-slate-400 hover:bg-slate-800 hover:text-white"
+            }`}
+          >
+            <MessageSquare className="h-4.5 w-4.5" />
+            <span>{tabNames[lang].ai}</span>
+          </button>
+        </nav>
+
+        {/* Language Selector in Sidebar */}
+        <div className="px-4 py-3 border-t border-slate-800 flex justify-between items-center bg-slate-950/40">
+          <span className="text-[10px] font-bold text-slate-500">LANGUAGE</span>
+          <div className="flex bg-slate-800 p-0.5 rounded-lg gap-0.5">
             {(["en", "hi", "te"] as Language[]).map((l) => (
               <button
                 key={l}
                 onClick={() => setLang(l)}
-                className={`px-2 py-1 text-xs font-black rounded-lg transition-colors uppercase ${lang === l ? "bg-white text-slate-950 shadow-sm" : "text-slate-500 hover:text-slate-800"}`}
+                className={`px-1.5 py-0.5 text-[9px] font-black rounded transition-colors uppercase ${lang === l ? "bg-white text-slate-950 shadow" : "text-slate-400 hover:text-slate-200"}`}
               >
                 {l}
               </button>
             ))}
           </div>
+        </div>
 
+        {/* Sidebar Footer Logout */}
+        <div className="p-4 border-t border-slate-800">
           <button
             onClick={onLogout}
-            className="p-2 bg-slate-100 text-slate-600 rounded-xl hover:bg-rose-50 hover:text-rose-600 transition-colors"
-            title={t.logout}
+            className="w-full flex items-center gap-3 px-4 py-3 rounded-xl font-black text-xs text-rose-400 hover:bg-rose-950/40 hover:text-rose-300 transition-colors"
           >
-            <LogOut className="h-5 w-5" />
+            <LogOut className="h-4.5 w-4.5" />
+            <span>{t.logout}</span>
           </button>
         </div>
-      </header>
+      </aside>
 
-      {/* Main Dashboard Panel */}
-      <main className="flex-1 p-4 max-w-lg mx-auto w-full space-y-6">
+      {/* Main Workspace Frame */}
+      <div className="flex-1 flex flex-col min-w-0">
+        {/* Universal Top Header */}
+        <header className="bg-white border-b border-slate-100 shadow-sm sticky top-0 z-30 px-6 py-4 flex items-center justify-between">
+          <div className="flex items-center gap-2">
+            <div className="bg-rose-500 text-white p-2 rounded-xl lg:hidden">
+              <Heart className="h-5 w-5 fill-white" />
+            </div>
+            <div>
+              <h1 className="text-xl font-extrabold text-slate-900 tracking-tight lg:hidden">VitalCare</h1>
+              <p className="text-xs text-rose-600 font-bold lg:hidden">{t.patientDashboard}</p>
+              <span className="hidden lg:inline text-xs font-black text-slate-400 tracking-wider uppercase">Patient Dashboard</span>
+            </div>
+          </div>
+
+          <div className="flex items-center gap-4">
+            {/* Real-Time Notification Bell */}
+            <div className="relative">
+              <button
+                id="notification-bell-btn"
+                onClick={() => setShowBellDropdown(!showBellDropdown)}
+                className="p-2.5 bg-slate-100 text-slate-600 rounded-xl hover:bg-slate-200 transition-colors relative cursor-pointer flex items-center justify-center min-h-[44px] min-w-[44px]"
+                title="Notifications"
+              >
+                <Bell className="h-5 w-5" />
+                {notifications.filter(n => !n.read).length > 0 && (
+                  <span className="absolute top-1 right-1 h-4 w-4 bg-rose-500 text-white font-black text-[9px] rounded-full flex items-center justify-center animate-bounce">
+                    {notifications.filter(n => !n.read).length}
+                  </span>
+                )}
+              </button>
+
+              {/* Bell Dropdown */}
+              {showBellDropdown && (
+                <div className="absolute right-0 mt-3 w-80 bg-white border border-slate-100 shadow-2xl rounded-3xl z-40 overflow-hidden py-2 animate-fade-in max-h-[480px] flex flex-col">
+                  <div className="px-4 py-2 border-b border-slate-50 flex items-center justify-between bg-slate-50/50">
+                    <span className="text-xs font-black text-slate-900">Notifications</span>
+                    {notifications.filter(n => !n.read).length > 0 && (
+                      <button
+                        onClick={handleMarkAllAsRead}
+                        className="text-[10px] font-black text-rose-600 hover:text-rose-700 transition-colors flex items-center gap-1 cursor-pointer"
+                      >
+                        <CheckCheck className="h-3.5 w-3.5" /> Mark all read
+                      </button>
+                    )}
+                  </div>
+
+                  <div className="flex-1 overflow-y-auto max-h-[360px] divide-y divide-slate-50">
+                    {notifications.length === 0 ? (
+                      <div className="py-8 text-center text-xs font-bold text-slate-400">
+                        No notifications yet
+                      </div>
+                    ) : (
+                      notifications.map((notif) => (
+                        <div
+                          key={notif.id}
+                          onClick={() => {
+                            handleMarkAsRead(notif.id);
+                          }}
+                          className={`p-3.5 flex gap-3 hover:bg-slate-50 transition-colors cursor-pointer text-left ${
+                            !notif.read ? "bg-rose-50/20" : ""
+                          }`}
+                        >
+                          <div className="mt-0.5 flex-shrink-0">
+                            {getNotificationIcon(notif.type)}
+                          </div>
+                          <div className="space-y-0.5 flex-1 min-w-0">
+                            <p className={`text-xs leading-normal break-words ${
+                              !notif.read ? "font-bold text-slate-900" : "font-semibold text-slate-600"
+                            }`}>
+                              {notif.message}
+                            </p>
+                            <span className="text-[9px] text-slate-400 font-bold block">
+                              {new Date(notif.created_at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })} • {new Date(notif.created_at).toLocaleDateString([], { month: 'short', day: 'numeric' })}
+                            </span>
+                          </div>
+                          {!notif.read && (
+                            <span className="h-2 w-2 bg-rose-500 rounded-full mt-2 flex-shrink-0" />
+                          )}
+                        </div>
+                      ))
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+
+            {/* Language Selector */}
+            <div className="flex bg-slate-100 p-1 rounded-xl gap-1">
+              {(["en", "hi", "te"] as Language[]).map((l) => (
+                <button
+                  key={l}
+                  onClick={() => setLang(l)}
+                  className={`px-2 py-1 text-xs font-black rounded-lg transition-colors uppercase cursor-pointer ${lang === l ? "bg-white text-slate-950 shadow-sm" : "text-slate-500 hover:text-slate-800"}`}
+                >
+                  {l}
+                </button>
+              ))}
+            </div>
+
+            <button
+              onClick={onLogout}
+              className="p-2.5 bg-slate-100 text-slate-600 rounded-xl hover:bg-rose-50 hover:text-rose-600 transition-colors cursor-pointer min-h-[44px] min-w-[44px] flex items-center justify-center"
+              title={t.logout}
+            >
+              <LogOut className="h-5 w-5" />
+            </button>
+          </div>
+        </header>
+
+        {/* Main Dashboard Panel - fluid and wide on desktop */}
+        <main className="flex-1 p-4 sm:p-6 lg:p-8 max-w-6xl mx-auto w-full space-y-6">
 
         {/* Dynamic Patient Welcome Card */}
         <div className="bg-gradient-to-r from-rose-500 to-rose-600 rounded-3xl p-6 text-white shadow-xl relative overflow-hidden">
@@ -1197,147 +1956,151 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
 
         {/* TAB 1: HOME (VITALS & RISK) */}
         {activeTab === "vitals" && (
-          <div className="space-y-6">
-            {/* Low Literacy Risk Score Display */}
-            <div className="bg-white border border-slate-200 rounded-3xl p-6 shadow-md text-center">
-              <h3 className="text-lg font-black text-slate-900 mb-2 flex items-center justify-center gap-2">
-                📊 {t.riskScore}
-              </h3>
-              
-              {/* Image-First Risk State */}
-              <div className="my-4">
-                {currentRisk === "low" && <LowRiskIllustration />}
-                {currentRisk === "medium" && <MediumRiskIllustration />}
-                {currentRisk === "high" && <HighRiskIllustration />}
+          <div className="grid grid-cols-1 md:grid-cols-2 gap-6 items-start">
+            <div className="space-y-6">
+              {/* Low Literacy Risk Score Display */}
+              <div className="bg-white border border-slate-200 rounded-3xl p-6 shadow-md text-center">
+                <h3 className="text-lg font-black text-slate-900 mb-2 flex items-center justify-center gap-2">
+                  📊 {t.riskScore}
+                </h3>
+                
+                {/* Image-First Risk State */}
+                <div className="my-4">
+                  {currentRisk === "low" && <LowRiskIllustration />}
+                  {currentRisk === "medium" && <MediumRiskIllustration />}
+                  {currentRisk === "high" && <HighRiskIllustration />}
+                </div>
+
+                {/* High-Contrast Label with color background */}
+                <div className={`inline-flex items-center gap-2 px-5 py-2.5 rounded-full text-base font-black border-2 shadow-sm ${
+                  currentRisk === "low" 
+                    ? "bg-emerald-50 border-emerald-300 text-emerald-700" 
+                    : currentRisk === "medium" 
+                      ? "bg-amber-50 border-amber-300 text-amber-700" 
+                      : "bg-rose-50 border-rose-300 text-rose-700 animate-pulse"
+                }`}>
+                  <span className="text-2xl">
+                    {currentRisk === "low" ? t.riskFaceLow : currentRisk === "medium" ? t.riskFaceMedium : t.riskFaceHigh}
+                  </span>
+                  <span>
+                    {currentRisk === "low" ? t.lowRisk : currentRisk === "medium" ? t.mediumRisk : t.highRisk}
+                  </span>
+                </div>
+
+                <div className="mt-4">
+                  <button
+                    onClick={() => setDetailModalContent({
+                      title: t.riskScore,
+                      body: "The Risk Score checks your recent oxygen level, heart rate, and blood pressure to make sure you are healthy and safe. Green 😊 means you are great! Yellow 😟 means take things slow. Red 🚨 means tell someone immediately."
+                    })}
+                    className="text-xs font-bold text-slate-500 hover:text-slate-800 underline block mx-auto"
+                  >
+                    ℹ️ {t.learnMore}
+                  </button>
+                </div>
               </div>
 
-              {/* High-Contrast Label with color background */}
-              <div className={`inline-flex items-center gap-2 px-5 py-2.5 rounded-full text-base font-black border-2 shadow-sm ${
-                currentRisk === "low" 
-                  ? "bg-emerald-50 border-emerald-300 text-emerald-700" 
-                  : currentRisk === "medium" 
-                    ? "bg-amber-50 border-amber-300 text-amber-700" 
-                    : "bg-rose-50 border-rose-300 text-rose-700 animate-pulse"
-              }`}>
-                <span className="text-2xl">
-                  {currentRisk === "low" ? t.riskFaceLow : currentRisk === "medium" ? t.riskFaceMedium : t.riskFaceHigh}
-                </span>
-                <span>
-                  {currentRisk === "low" ? t.lowRisk : currentRisk === "medium" ? t.mediumRisk : t.highRisk}
-                </span>
-              </div>
-
-              <div className="mt-4">
+              {/* Quick Action Button Grid */}
+              <div className="grid grid-cols-2 gap-4">
                 <button
-                  onClick={() => setDetailModalContent({
-                    title: t.riskScore,
-                    body: "The Risk Score checks your recent oxygen level, heart rate, and blood pressure to make sure you are healthy and safe. Green 😊 means you are great! Yellow 😟 means take things slow. Red 🚨 means tell someone immediately."
-                  })}
-                  className="text-xs font-bold text-slate-500 hover:text-slate-800 underline block mx-auto"
+                  onClick={() => setShowLogModal(true)}
+                  className="bg-emerald-50 hover:bg-emerald-100 border-2 border-emerald-200 p-5 rounded-3xl text-center active:scale-95 transition-all shadow-sm"
                 >
-                  ℹ️ {t.learnMore}
+                  <LogVitalsIllustration />
+                  <span className="block text-emerald-900 font-black text-sm mt-3">{t.addVitals}</span>
+                  <span className="block text-emerald-600 text-[10px] font-bold mt-1">📝 Heart, BP, O2</span>
+                </button>
+
+                <button
+                  onClick={() => setActiveTab("ai")}
+                  className="bg-sky-50 hover:bg-sky-100 border-2 border-sky-200 p-5 rounded-3xl text-center active:scale-95 transition-all shadow-sm"
+                >
+                  <AskAIIllustration />
+                  <span className="block text-sky-900 font-black text-sm mt-3">{t.askAI}</span>
+                  <span className="block text-sky-600 text-[10px] font-bold mt-1">🤖 Gemini Companion</span>
                 </button>
               </div>
-            </div>
 
-            {/* AI Generated Insights Section */}
-            <div className="bg-sky-50 border border-sky-200 rounded-3xl p-5 shadow-sm">
-              <h3 className="text-sm font-black text-sky-950 flex items-center gap-1.5 mb-2">
-                <Sparkles className="h-4 w-4 text-sky-600 fill-sky-600" /> AI HEALTH TREND INSIGHTS
-              </h3>
-              {insightsLoading ? (
-                <div className="flex items-center gap-2 text-xs text-sky-700 font-semibold py-2">
-                  <span className="animate-spin rounded-full h-3 w-3 border-2 border-sky-700 border-t-transparent"></span>
-                  Reading health history...
-                </div>
-              ) : (
-                <p className="text-xs text-slate-700 font-medium leading-relaxed">
-                  {aiInsights || "No health history logged yet. Log your vitals using the button below to receive AI-powered health trends."}
-                </p>
-              )}
-            </div>
-
-            {/* Quick Action Button Grid */}
-            <div className="grid grid-cols-2 gap-4">
-              <button
-                onClick={() => setShowLogModal(true)}
-                className="bg-emerald-50 hover:bg-emerald-100 border-2 border-emerald-200 p-5 rounded-3xl text-center active:scale-95 transition-all shadow-sm"
-              >
-                <LogVitalsIllustration />
-                <span className="block text-emerald-900 font-black text-sm mt-3">{t.addVitals}</span>
-                <span className="block text-emerald-600 text-[10px] font-bold mt-1">📝 Heart, BP, O2</span>
-              </button>
-
-              <button
-                onClick={() => setActiveTab("ai")}
-                className="bg-sky-50 hover:bg-sky-100 border-2 border-sky-200 p-5 rounded-3xl text-center active:scale-95 transition-all shadow-sm"
-              >
-                <AskAIIllustration />
-                <span className="block text-sky-900 font-black text-sm mt-3">{t.askAI}</span>
-                <span className="block text-sky-600 text-[10px] font-bold mt-1">🤖 Gemini Companion</span>
-              </button>
-            </div>
-
-            {/* Latest Vitals List */}
-            <div className="bg-white border border-slate-200 rounded-3xl p-5 shadow-md">
-              <div className="flex justify-between items-center mb-4">
-                <h3 className="text-sm font-black text-slate-900 flex items-center gap-1.5">
-                  <Activity className="h-4 w-4 text-rose-500" /> {t.healthTimeline}
+              {/* AI Generated Insights Section */}
+              <div className="bg-sky-50 border border-sky-200 rounded-3xl p-5 shadow-sm">
+                <h3 className="text-sm font-black text-sky-950 flex items-center gap-1.5 mb-2">
+                  <Sparkles className="h-4 w-4 text-sky-600 fill-sky-600" /> AI HEALTH TREND INSIGHTS
                 </h3>
-                <span className="text-[10px] font-bold text-slate-500">History ({vitals.length})</span>
+                {insightsLoading ? (
+                  <div className="flex items-center gap-2 text-xs text-sky-700 font-semibold py-2">
+                    <span className="animate-spin rounded-full h-3 w-3 border-2 border-sky-700 border-t-transparent"></span>
+                    Reading health history...
+                  </div>
+                ) : (
+                  <p className="text-xs text-slate-700 font-medium leading-relaxed">
+                    {aiInsights || "No health history logged yet. Log your vitals using the button below to receive AI-powered health trends."}
+                  </p>
+                )}
               </div>
+            </div>
 
-              {vitals.length === 0 ? (
-                <div className="text-center py-6 text-slate-400 text-xs font-semibold">
-                  No readings logged. Log your vitals to start tracking.
+            <div className="space-y-6">
+              {/* Latest Vitals List */}
+              <div className="bg-white border border-slate-200 rounded-3xl p-5 shadow-md">
+                <div className="flex justify-between items-center mb-4">
+                  <h3 className="text-sm font-black text-slate-900 flex items-center gap-1.5">
+                    <Activity className="h-4 w-4 text-rose-500" /> {t.healthTimeline}
+                  </h3>
+                  <span className="text-[10px] font-bold text-slate-500">History ({vitals.length})</span>
                 </div>
-              ) : (
-                <div className="space-y-3.5 max-h-60 overflow-y-auto pr-1">
-                  {vitals.map((v, idx) => (
-                    <div
-                      key={idx}
-                      className={`p-3.5 rounded-2xl border flex items-center justify-between ${
-                        v.risk_level === "low" 
-                          ? "bg-emerald-50/50 border-emerald-100 text-emerald-950" 
-                          : v.risk_level === "medium" 
-                            ? "bg-amber-50/50 border-amber-100 text-amber-950" 
-                            : "bg-rose-50/50 border-rose-100 text-rose-950"
-                      }`}
-                    >
-                      <div className="space-y-1">
-                        <div className="flex items-center gap-1.5 text-xs font-black">
-                          <span className="text-base">
-                            {v.risk_level === "low" ? "😊" : v.risk_level === "medium" ? "😟" : "🚨"}
-                          </span>
-                          <span>
-                            {new Date(v.timestamp).toLocaleDateString(undefined, {
-                              month: "short",
-                              day: "numeric",
-                              hour: "2-digit",
-                              minute: "2-digit"
-                            })}
-                          </span>
+
+                {vitals.length === 0 ? (
+                  <div className="text-center py-6 text-slate-400 text-xs font-semibold">
+                    No readings logged. Log your vitals to start tracking.
+                  </div>
+                ) : (
+                  <div className="space-y-3.5 max-h-96 overflow-y-auto pr-1">
+                    {vitals.map((v, idx) => (
+                      <div
+                        key={idx}
+                        className={`p-3.5 rounded-2xl border flex items-center justify-between ${
+                          v.risk_level === "low" 
+                            ? "bg-emerald-50/50 border-emerald-100 text-emerald-950" 
+                            : v.risk_level === "medium" 
+                              ? "bg-amber-50/50 border-amber-100 text-amber-950" 
+                              : "bg-rose-50/50 border-rose-100 text-rose-950"
+                        }`}
+                      >
+                        <div className="space-y-1">
+                          <div className="flex items-center gap-1.5 text-xs font-black">
+                            <span className="text-base">
+                              {v.risk_level === "low" ? "😊" : v.risk_level === "medium" ? "😟" : "🚨"}
+                            </span>
+                            <span>
+                              {new Date(v.timestamp).toLocaleDateString(undefined, {
+                                month: "short",
+                                day: "numeric",
+                                hour: "2-digit",
+                                minute: "2-digit"
+                              })}
+                            </span>
+                          </div>
+                          <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[11px] font-bold text-slate-600">
+                            <div>💓 {v.readings.heartRate} bpm</div>
+                            <div>🩸 {v.readings.systolic}/{v.readings.diastolic} BP</div>
+                            <div>🫧 O2: {v.readings.oxygenLevel}%</div>
+                            <div>🌡️ {v.readings.temperature}°C</div>
+                          </div>
                         </div>
-                        <div className="grid grid-cols-2 gap-x-3 gap-y-0.5 text-[11px] font-bold text-slate-600">
-                          <div>💓 {v.readings.heartRate} bpm</div>
-                          <div>🩸 {v.readings.systolic}/{v.readings.diastolic} BP</div>
-                          <div>🫧 O2: {v.readings.oxygenLevel}%</div>
-                          <div>🌡️ {v.readings.temperature}°C</div>
-                        </div>
+                        <span className={`text-[10px] font-black px-2.5 py-1 rounded-full uppercase border ${
+                          v.risk_level === "low" 
+                            ? "bg-emerald-100 border-emerald-300 text-emerald-800" 
+                            : v.risk_level === "medium" 
+                              ? "bg-amber-100 border-amber-300 text-amber-800" 
+                              : "bg-rose-100 border-rose-300 text-rose-800"
+                        }`}>
+                          {v.risk_level}
+                        </span>
                       </div>
-                      <span className={`text-[10px] font-black px-2.5 py-1 rounded-full uppercase border ${
-                        v.risk_level === "low" 
-                          ? "bg-emerald-100 border-emerald-300 text-emerald-800" 
-                          : v.risk_level === "medium" 
-                            ? "bg-amber-100 border-amber-300 text-amber-800" 
-                            : "bg-rose-100 border-rose-300 text-rose-800"
-                      }`}>
-                        {v.risk_level}
-                      </span>
-                    </div>
-                  ))}
-                </div>
-              )}
+                    ))}
+                  </div>
+                )}
+              </div>
             </div>
           </div>
         )}
@@ -1345,70 +2108,190 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
         {/* TAB 2: DOCTORS & APPOINTMENTS */}
         {activeTab === "doctors" && (
           <div className="space-y-6">
-            {/* Book Appointment Section */}
-            <div className="bg-white border border-slate-200 rounded-3xl p-5 shadow-md">
-              <h3 className="text-base font-black text-slate-900 mb-4 flex items-center gap-2">
-                📅 {t.bookAppointment}
-              </h3>
+            {/* Find a Doctor Panel */}
+            <div className="bg-white border border-slate-200 rounded-3xl p-6 shadow-md animate-fade-in space-y-6">
+              <div className="space-y-1.5">
+                <h3 className="text-xl font-black text-slate-900 tracking-tight flex items-center gap-2">
+                  🔍 Find a Doctor
+                </h3>
+                <p className="text-xs text-slate-500 font-medium leading-relaxed">
+                  Search, filter, and compare top-rated medical specialists affiliated with our nearby healthcare partners.
+                </p>
+              </div>
 
-              <form onSubmit={handleBookAppointment} className="space-y-4">
+              {/* Filters and Sorting Controls */}
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+                {/* Search input */}
+                <div className="relative">
+                  <Search className="absolute left-3.5 top-3 h-4 w-4 text-slate-400" />
+                  <input
+                    type="text"
+                    value={doctorSearchQuery}
+                    onChange={(e) => setDoctorSearchQuery(e.target.value)}
+                    placeholder="Search doctor, hospital, or bio..."
+                    className="pl-10 pr-4 py-2.5 w-full bg-slate-50 border border-slate-200 rounded-2xl text-xs font-bold text-slate-800 placeholder-slate-400 focus:bg-white focus:ring-1 focus:ring-rose-500/20 focus:border-rose-500 outline-none transition-all"
+                  />
+                  {doctorSearchQuery && (
+                    <button
+                      onClick={() => setDoctorSearchQuery("")}
+                      className="absolute right-3 top-3 text-slate-400 hover:text-slate-600"
+                    >
+                      <X className="h-4 w-4" />
+                    </button>
+                  )}
+                </div>
+
+                {/* Specialization filter */}
                 <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1">Select Doctor</label>
                   <select
-                    required
-                    value={selectedDoctorId}
-                    onChange={(e) => {
-                      setSelectedDoctorId(e.target.value);
-                      const selected = allDoctorsList.find(d => d.uid === e.target.value);
-                      setSelectedDoctorName(selected ? selected.fullName : "");
-                    }}
-                    className="block w-full border border-slate-300 rounded-2xl py-2.5 px-3 text-sm text-slate-900"
+                    value={doctorFilterSpecialization}
+                    onChange={(e) => setDoctorFilterSpecialization(e.target.value)}
+                    className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-2xl text-xs font-bold text-slate-700 outline-none focus:bg-white focus:ring-1 focus:ring-rose-500/20 focus:border-rose-500 transition-all"
                   >
-                    <option value="">-- Choose Doctor --</option>
-                    {allDoctorsList.map((d) => (
-                      <option key={d.uid} value={d.uid}>
-                        👨‍⚕️ {d.fullName} ({d.specialization || "General Physician"})
-                      </option>
-                    ))}
+                    <option value="">⚡ All Specializations</option>
+                    <option value="General Care">🩺 General Care</option>
+                    <option value="Heart Care">❤️ Heart Care</option>
+                    <option value="Pediatrics">👶 Pediatrics</option>
+                    <option value="Brain Care">🧠 Brain Care</option>
+                    <option value="Orthopedics">🦴 Orthopedics</option>
                   </select>
                 </div>
 
+                {/* Sort dropdown */}
                 <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1">Date and Time</label>
-                  <input
-                    type="datetime-local"
-                    required
-                    value={appointmentDate}
-                    onChange={(e) => setAppointmentDate(e.target.value)}
-                    className="block w-full border border-slate-300 rounded-2xl py-2.5 px-3 text-sm text-slate-900"
-                  />
+                  <select
+                    value={doctorSortBy}
+                    onChange={(e) => setDoctorSortBy(e.target.value)}
+                    className="w-full px-3.5 py-2.5 bg-slate-50 border border-slate-200 rounded-2xl text-xs font-bold text-slate-700 outline-none focus:bg-white focus:ring-1 focus:ring-rose-500/20 focus:border-rose-500 transition-all"
+                  >
+                    <option value="rating">⭐ Sort by: Rating</option>
+                    <option value="experience">💼 Sort by: Experience</option>
+                    <option value="fee">🪙 Sort by: consultation fee (Low to High)</option>
+                  </select>
                 </div>
+              </div>
 
-                <div>
-                  <label className="block text-xs font-bold text-slate-700 mb-1">Simple Notes for Doctor</label>
-                  <textarea
-                    rows={2}
-                    value={appointmentNotes}
-                    onChange={(e) => setAppointmentNotes(e.target.value)}
-                    placeholder="Briefly say what is bothering you..."
-                    className="block w-full border border-slate-300 rounded-2xl py-2 px-3 text-sm text-slate-900"
-                  />
+              {/* Grid of Doctor Cards */}
+              {filteredAndSortedDoctors.length === 0 ? (
+                <div className="p-8 border border-dashed rounded-3xl bg-slate-50/60 text-center space-y-2">
+                  <p className="text-sm font-bold text-slate-400">No doctors match your filters.</p>
+                  <button
+                    onClick={() => {
+                      setDoctorSearchQuery("");
+                      setDoctorFilterSpecialization("");
+                      setDoctorSortBy("rating");
+                    }}
+                    className="text-xs font-black text-rose-500 hover:underline"
+                  >
+                    Reset all filters
+                  </button>
                 </div>
+              ) : (
+                <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-4">
+                  {filteredAndSortedDoctors.map((docItem) => {
+                    // Match doctor specialization style
+                    const specStyles = (() => {
+                      switch (docItem.specialization) {
+                        case "Heart Care":
+                          return { icon: "❤️", theme: "bg-rose-50 text-rose-700 border-rose-100" };
+                        case "Pediatrics":
+                          return { icon: "👶", theme: "bg-sky-50 text-sky-700 border-sky-100" };
+                        case "Brain Care":
+                          return { icon: "🧠", theme: "bg-purple-50 text-purple-700 border-purple-100" };
+                        case "General Care":
+                          return { icon: "🩺", theme: "bg-emerald-50 text-emerald-700 border-emerald-100" };
+                        case "Orthopedics":
+                          return { icon: "🦴", theme: "bg-amber-50 text-amber-700 border-amber-100" };
+                        default:
+                          return { icon: "🩺", theme: "bg-slate-50 text-slate-700 border-slate-100" };
+                      }
+                    })();
 
-                <button
-                  type="submit"
-                  disabled={bookingLoading}
-                  className="w-full bg-rose-500 hover:bg-rose-600 active:scale-95 text-white font-black py-3 rounded-2xl text-sm transition-all"
-                >
-                  {bookingLoading ? "Submitting request..." : "Book Now"}
-                </button>
+                    // Find patient relation status
+                    const rel = doctors.find(rd => rd.doctor_id === docItem.uid);
+                    const isLinked = rel && rel.status === "active";
+                    const isPending = rel && rel.status === "pending";
 
-                {bookingStatus && (
-                  <div className="p-3 text-xs font-black text-center rounded-xl bg-slate-100 text-slate-800 border">
-                    {bookingStatus}
-                  </div>
-                )}
-              </form>
+                    // Formulate initials for the placeholder avatar
+                    const initials = docItem.fullName
+                      ? docItem.fullName.split(" ").map((n: string) => n[0]).join("").substring(0, 2).toUpperCase()
+                      : "DR";
+
+                    return (
+                      <div
+                        key={docItem.uid}
+                        className="bg-white border border-slate-150 rounded-2xl p-4 flex flex-col justify-between hover:shadow-lg hover:border-slate-300 transition-all text-xs relative overflow-hidden"
+                      >
+                        <div className="space-y-3">
+                          {/* Top row with specialization and rating */}
+                          <div className="flex justify-between items-center">
+                            <span className={`px-2.5 py-1 rounded-full border text-[9px] font-black uppercase tracking-wider flex items-center gap-1 ${specStyles.theme}`}>
+                              <span>{specStyles.icon}</span>
+                              <span>{docItem.specialization || "General Physician"}</span>
+                            </span>
+                            <span className="bg-amber-50 border border-amber-100 text-amber-800 font-extrabold px-1.5 py-0.5 rounded text-[9px] flex items-center gap-0.5">
+                              ⭐ {docItem.rating || 4.8}
+                            </span>
+                          </div>
+
+                          {/* Profile Details Header */}
+                          <div className="flex gap-3">
+                            {/* Initials circle photo placeholder */}
+                            <div className="w-12 h-12 rounded-full bg-slate-100 border border-slate-200 text-slate-700 font-black text-sm flex items-center justify-center tracking-wide shadow-sm flex-shrink-0">
+                              {initials}
+                            </div>
+                            <div className="min-w-0 flex-1">
+                              <h4 className="font-extrabold text-slate-900 text-sm truncate">Dr. {docItem.fullName}</h4>
+                              <p className="text-[10px] text-slate-400 font-bold">{docItem.qualification || "MBBS, MD"}</p>
+                              <p className="text-[10px] text-slate-500 font-semibold">{docItem.experience || 10} years experience</p>
+                            </div>
+                          </div>
+
+                          {/* Hospital & Fee brief */}
+                          <div className="space-y-1 bg-slate-50 p-2.5 rounded-xl border border-slate-100 text-[10px]">
+                            <div className="font-bold text-slate-600 truncate flex items-center gap-1">
+                              🏥 {docItem.hospitalName || "Partner Hospital"}
+                            </div>
+                            <div className="font-semibold text-slate-500 flex justify-between items-center">
+                              <span>Fee: ₹{docItem.consultationFee || 500}</span>
+                              <span className="text-emerald-600 font-extrabold">Active Slots ✅</span>
+                            </div>
+                          </div>
+                        </div>
+
+                        {/* Action triggers */}
+                        <div className="mt-4 pt-3 border-t flex items-center justify-between gap-2">
+                          <div>
+                            {isLinked ? (
+                              <span className="text-[9px] font-black uppercase bg-emerald-50 border border-emerald-200 text-emerald-800 px-2 py-0.5 rounded-md">
+                                Connected ✅
+                              </span>
+                            ) : isPending ? (
+                              <span className="text-[9px] font-black uppercase bg-amber-50 border border-amber-200 text-amber-800 px-2 py-0.5 rounded-md animate-pulse">
+                                Pending ⏳
+                              </span>
+                            ) : (
+                              <span className="text-[9px] font-bold text-slate-400">Available</span>
+                            )}
+                          </div>
+
+                          <button
+                            onClick={() => {
+                              setSelectedDoctorForDetail(docItem);
+                              setSelectedDoctorId(docItem.uid);
+                              setSelectedDoctorName(docItem.fullName);
+                              setBookingStatus("");
+                            }}
+                            className="bg-rose-500 hover:bg-rose-600 text-white font-black px-3.5 py-1.5 rounded-xl shadow-sm hover:shadow-md transition-all active:scale-95 text-[10px] cursor-pointer"
+                          >
+                            View Profile & Book
+                          </button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              )}
             </div>
 
             {/* My Doctors Assignments */}
@@ -1573,7 +2456,7 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
         {/* TAB 4: AI COMPANION */}
         {activeTab === "ai" && (
           <div className="space-y-6">
-            <div className="bg-white border border-slate-200 rounded-3xl p-5 shadow-md flex flex-col h-[450px]">
+            <div className="bg-white border border-slate-200 rounded-3xl p-5 shadow-md flex flex-col h-[520px]">
               <div className="flex items-center gap-2 pb-3 border-b">
                 <AskAIIllustration />
                 <div>
@@ -1596,7 +2479,43 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
                         ? "bg-rose-500 text-white font-semibold rounded-tr-none" 
                         : "bg-slate-100 text-slate-900 rounded-tl-none border"
                     }`}>
-                      {msg.content}
+                      {msg.attachment && (
+                        <div className="mb-2">
+                          {msg.attachment.mimeType.startsWith("image/") ? (
+                            <img 
+                              src={`data:${msg.attachment.mimeType};base64,${msg.attachment.data}`} 
+                              alt="attached image" 
+                              className="max-w-full max-h-48 rounded-lg border border-slate-200 object-cover"
+                            />
+                          ) : msg.attachment.mimeType.startsWith("audio/") ? (
+                            <div className={`flex flex-col gap-1 p-2 rounded-xl ${
+                              msg.role === "user" 
+                                ? "bg-rose-600/50 text-white" 
+                                : "bg-slate-200 text-slate-800"
+                            }`}>
+                              <span className="text-[10px] font-black flex items-center gap-1">
+                                <Mic className="h-3 w-3 shrink-0" />
+                                Voice Note
+                              </span>
+                              <audio 
+                                src={`data:${msg.attachment.mimeType};base64,${msg.attachment.data}`} 
+                                controls 
+                                className="w-full max-w-[200px] h-8 mt-0.5 scale-90 origin-left" 
+                              />
+                            </div>
+                          ) : (
+                            <div className={`flex items-center gap-2 p-2 rounded-xl text-[11px] font-black border ${
+                              msg.role === "user" 
+                                ? "bg-rose-600/50 border-rose-400 text-white" 
+                                : "bg-slate-200 border-slate-300 text-slate-700"
+                            }`}>
+                              <FileText className="h-4 w-4 shrink-0" />
+                              <span className="truncate max-w-[150px]">{msg.attachment.name}</span>
+                            </div>
+                          )}
+                        </div>
+                      )}
+                      <div>{msg.content}</div>
                     </div>
                   </div>
                 ))}
@@ -1610,24 +2529,140 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
                   </div>
                 )}
               </div>
+              
+              {/* Speech Error Banner */}
+              {speechError && (
+                <div className="bg-amber-50 border border-amber-200 text-amber-800 p-2.5 px-3 rounded-2xl mb-2 text-[11px] font-bold flex items-center justify-between text-left animate-pulse">
+                  <span>{speechError}</span>
+                  <button 
+                    type="button" 
+                    onClick={() => setSpeechError(null)} 
+                    className="text-amber-500 hover:text-amber-700 p-1 rounded-full hover:bg-amber-100 cursor-pointer"
+                  >
+                    <X className="h-3 w-3" />
+                  </button>
+                </div>
+              )}
 
-              {/* Chat Input */}
-              <form onSubmit={handleSendChatMessage} className="flex gap-2 pt-3 border-t">
-                <input
-                  type="text"
-                  required
-                  value={chatInput}
-                  onChange={(e) => setChatInput(e.target.value)}
-                  placeholder="Ask a general health question..."
-                  className="flex-1 border border-slate-300 rounded-2xl px-4 py-2.5 text-xs text-slate-900"
+              {/* Attachment Preview (above input box) */}
+              {chatAttachment && (
+                <div className="flex items-center justify-between bg-slate-50 border border-slate-200 p-2.5 rounded-2xl mb-2 text-xs">
+                  <div className="flex items-center gap-2.5">
+                    {chatAttachment.mimeType.startsWith("image/") ? (
+                      <img 
+                        src={`data:${chatAttachment.mimeType};base64,${chatAttachment.data}`} 
+                        alt="Preview" 
+                        className="h-10 w-10 object-cover rounded-xl border border-slate-200 shadow-sm"
+                      />
+                    ) : chatAttachment.mimeType.startsWith("audio/") ? (
+                      <div className="bg-rose-100 text-rose-600 p-2 rounded-full animate-pulse">
+                        <Mic className="h-4 w-4" />
+                      </div>
+                    ) : (
+                      <div className="bg-slate-100 text-slate-500 p-2 rounded-full">
+                        <FileText className="h-4 w-4" />
+                      </div>
+                    )}
+                    <div className="flex flex-col text-left">
+                      <span className="font-bold text-[11px] text-slate-800 max-w-[180px] truncate">{chatAttachment.name}</span>
+                      <span className="text-[9px] text-slate-400 uppercase font-black">
+                        {chatAttachment.mimeType.split("/")[1] || "file"} • {(chatAttachment.data.length * 0.75 / 1024).toFixed(0)} KB
+                      </span>
+                    </div>
+                  </div>
+                  <button 
+                    type="button"
+                    onClick={() => setChatAttachment(null)}
+                    className="text-slate-400 hover:text-slate-600 p-1.5 hover:bg-slate-200 rounded-full transition-all active:scale-90 cursor-pointer"
+                  >
+                    <X className="h-4 w-4" />
+                  </button>
+                </div>
+              )}
+
+              {/* Chat Input Form */}
+              <form onSubmit={handleSendChatMessage} className="flex flex-col gap-2 pt-3 border-t">
+                {/* Hidden File Input */}
+                <input 
+                  type="file" 
+                  ref={fileInputRef} 
+                  className="hidden" 
+                  onChange={handleFileChange}
                 />
-                <button
-                  type="submit"
-                  disabled={chatLoading}
-                  className="bg-rose-500 text-white p-3 rounded-2xl active:scale-95 transition-all shadow-md hover:bg-rose-600 disabled:opacity-50"
-                >
-                  <Send className="h-4 w-4" />
-                </button>
+
+                <div className="flex items-center gap-2">
+                  {/* File attach button */}
+                  <button
+                    type="button"
+                    onClick={() => fileInputRef.current?.click()}
+                    disabled={chatLoading}
+                    title="Upload health files, reports, or images"
+                    className="bg-slate-100 text-slate-600 p-3 rounded-2xl active:scale-95 transition-all shadow-sm hover:bg-slate-200 disabled:opacity-50 cursor-pointer shrink-0"
+                  >
+                    <Paperclip className="h-4 w-4" />
+                  </button>
+
+                  {/* Speech Dictation typing button */}
+                  <button
+                    type="button"
+                    onClick={toggleListening}
+                    disabled={chatLoading || isRecordingAudio}
+                    title={isListening ? "Listening... click to stop" : "Type with Voice"}
+                    className={`p-3 rounded-2xl active:scale-95 transition-all shadow-sm disabled:opacity-50 cursor-pointer shrink-0 ${
+                      isListening 
+                        ? "bg-rose-500 text-white animate-bounce" 
+                        : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                    }`}
+                  >
+                    {isListening ? <MicOff className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
+                  </button>
+
+                  {/* Audio note voice recorder button */}
+                  <button
+                    type="button"
+                    onClick={isRecordingAudio ? stopRecordingAudio : startRecordingAudio}
+                    disabled={chatLoading || isListening}
+                    title={isRecordingAudio ? "Recording... Click to save note" : "Record voice note"}
+                    className={`p-3 rounded-2xl active:scale-95 transition-all shadow-sm disabled:opacity-50 cursor-pointer shrink-0 ${
+                      isRecordingAudio 
+                        ? "bg-emerald-500 text-white animate-pulse" 
+                        : "bg-slate-100 text-slate-600 hover:bg-slate-200"
+                    }`}
+                  >
+                    <div className="flex items-center justify-center relative">
+                      {isRecordingAudio && (
+                        <span className="absolute -top-1 -right-1 flex h-2 w-2">
+                          <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-red-400 opacity-75"></span>
+                          <span className="relative inline-flex rounded-full h-2 w-2 bg-red-500"></span>
+                        </span>
+                      )}
+                      <Activity className="h-4 w-4" />
+                    </div>
+                  </button>
+
+                  <input
+                    type="text"
+                    value={chatInput}
+                    onChange={(e) => setChatInput(e.target.value)}
+                    placeholder={
+                      isRecordingAudio 
+                        ? "Recording audio..." 
+                        : isListening 
+                          ? "Listening..." 
+                          : "Ask wellness or report questions..."
+                    }
+                    disabled={chatLoading || isRecordingAudio}
+                    className="flex-1 border border-slate-300 rounded-2xl px-4 py-2.5 text-xs text-slate-900 focus:border-rose-500 focus:ring-1 focus:ring-rose-500 focus:outline-none"
+                  />
+
+                  <button
+                    type="submit"
+                    disabled={chatLoading || (!chatInput.trim() && !chatAttachment)}
+                    className="bg-rose-500 text-white p-3 rounded-2xl active:scale-95 transition-all shadow-md hover:bg-rose-600 disabled:opacity-40 disabled:cursor-not-allowed shrink-0 cursor-pointer"
+                  >
+                    <Send className="h-4 w-4" />
+                  </button>
+                </div>
               </form>
             </div>
 
@@ -2133,83 +3168,341 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
               )}
 
               {/* Nearest Hospitals List */}
-              <div className="space-y-3">
+              <div className="space-y-6">
                 {sortedAndFilteredHospitals.length === 0 ? (
                   <div className="p-6 border border-dashed rounded-2xl bg-slate-50 text-center text-xs font-bold text-slate-400">
                     No hospitals found matching "{selectedSpecialization}"
                   </div>
                 ) : (
-                  sortedAndFilteredHospitals.map((h, idx) => {
-                    const isHighlighted = hoveredHospitalId === h.id || hoveredHospitalId === `index-${idx}`;
-                    return (
-                      <div
-                        key={idx}
-                        className={`p-4 border rounded-2xl transition-all flex justify-between items-start text-xs ${
-                          isHighlighted
-                            ? "border-emerald-500 bg-emerald-50/70 shadow-md ring-1 ring-emerald-500/20"
-                            : "border-slate-100 bg-emerald-50/30 hover:bg-emerald-50/50"
-                        }`}
-                        onMouseEnter={() => setHoveredHospitalId(h.id || `index-${idx}`)}
-                        onMouseLeave={() => setHoveredHospitalId(null)}
-                      >
-                        <div className="space-y-1.5 flex-1 min-w-0 pr-3">
-                          <div className="flex items-center gap-2">
-                            <span className="flex-shrink-0 w-5 h-5 rounded-full bg-emerald-600 text-white font-black text-[10px] flex items-center justify-center">
-                              {idx + 1}
-                            </span>
-                            <h4 className="font-black text-emerald-950 text-sm truncate">{h.name}</h4>
-                          </div>
-
-                          <div className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400">
-                            <span>📍 {h.location}</span>
-                            {h.distance !== undefined && h.distance !== Infinity && (
-                              <span className="bg-emerald-100 text-emerald-900 px-1.5 py-0.5 rounded font-black text-[9px]">
-                                {h.distance.toFixed(1)} km away
-                              </span>
-                            )}
-                          </div>
-
-                          <div className="flex gap-1 flex-wrap mt-1">
-                            {h.specializations.map((spec, i) => (
-                              <span
-                                key={i}
-                                className="text-[9px] bg-emerald-100/70 text-emerald-800 font-extrabold px-2 py-0.5 rounded-full"
+                  <>
+                    {/* Part 1: Primary Recommendations (Where your doctor practices) */}
+                    {sortedAndFilteredHospitals.some(h => (h as any).activeDoctors && (h as any).activeDoctors.length > 0) && (
+                      <div className="space-y-3">
+                        <div className="text-[11px] font-black text-rose-600 tracking-wider uppercase bg-rose-50 border border-rose-100 px-3.5 py-1.5 rounded-2xl flex items-center gap-1.5 shadow-sm">
+                          🩺 RECOMMENDED: YOUR DOCTOR PRACTICES HERE
+                        </div>
+                        {sortedAndFilteredHospitals
+                          .filter(h => (h as any).activeDoctors && (h as any).activeDoctors.length > 0)
+                          .map((h, idx) => {
+                            const isHighlighted = hoveredHospitalId === h.id || hoveredHospitalId === `index-recommended-${idx}`;
+                            return (
+                              <div
+                                key={`recommended-${idx}`}
+                                className={`p-4 border rounded-3xl transition-all flex justify-between items-start text-xs border-rose-200 bg-rose-50/20 shadow-sm hover:shadow-md hover:bg-rose-50/40 relative overflow-hidden`}
+                                onMouseEnter={() => setHoveredHospitalId(h.id || `index-recommended-${idx}`)}
+                                onMouseLeave={() => setHoveredHospitalId(null)}
                               >
-                                {spec}
-                              </span>
-                            ))}
-                          </div>
-                        </div>
+                                {/* Special background decorative badge */}
+                                <div className="absolute right-0 top-0 bg-rose-500 text-white text-[8px] font-black tracking-widest uppercase px-3 py-1 rounded-bl-xl shadow-sm">
+                                  Your Doctor
+                                </div>
+                                <div className="space-y-1.5 flex-1 min-w-0 pr-3">
+                                  <div className="flex items-center gap-2">
+                                    <span className="flex-shrink-0 w-5 h-5 rounded-full bg-rose-600 text-white font-black text-[10px] flex items-center justify-center">
+                                      ★
+                                    </span>
+                                    <h4 className="font-black text-slate-900 text-sm truncate">{h.name}</h4>
+                                  </div>
 
-                        <div className="flex gap-2">
-                          <a
-                            href={`tel:${h.contact}`}
-                            className="bg-white border border-slate-200 text-slate-600 p-2 rounded-xl hover:bg-slate-50 shadow-sm transition-colors flex items-center justify-center h-9 w-9"
-                            title={`Call ${h.name}`}
-                          >
-                            <Phone className="h-4 w-4 text-slate-500" />
-                          </a>
+                                  <div className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400">
+                                    <span>📍 {h.location}</span>
+                                    {h.distance !== undefined && h.distance !== Infinity && (
+                                      <span className="bg-rose-100 text-rose-900 px-1.5 py-0.5 rounded font-black text-[9px]">
+                                        {h.distance.toFixed(1)} km away
+                                      </span>
+                                    )}
+                                  </div>
 
-                          {patientCoords && h.lat !== undefined && h.lng !== undefined && (
-                            <a
-                              href={`https://www.google.com/maps/dir/?api=1&origin=${patientCoords.lat},${patientCoords.lng}&destination=${h.lat},${h.lng}`}
-                              target="_blank"
-                              rel="noopener noreferrer"
-                              className="bg-emerald-600 text-white p-2 rounded-xl hover:bg-emerald-700 shadow-sm transition-colors flex items-center justify-center h-9 w-9"
-                              title="Get Directions"
-                            >
-                              <Navigation className="h-4 w-4" />
-                            </a>
-                          )}
-                        </div>
+                                  <div className="text-[10px] font-bold text-slate-700 bg-white border border-slate-200 py-1.5 px-3 rounded-xl inline-flex items-center gap-1 mt-1.5">
+                                    🩺 <span className="text-slate-900 font-extrabold">{(h as any).activeDoctors.join(", ")}</span> is based at this hospital.
+                                  </div>
+
+                                  <div className="flex gap-1 flex-wrap mt-1">
+                                    {h.specializations.map((spec, i) => (
+                                      <span
+                                        key={i}
+                                        className="text-[9px] bg-slate-100 text-slate-800 font-extrabold px-2 py-0.5 rounded-full border border-slate-200"
+                                      >
+                                        {spec}
+                                      </span>
+                                    ))}
+                                  </div>
+                                </div>
+
+                                <div className="flex gap-2">
+                                  <a
+                                    href={`tel:${h.contact}`}
+                                    className="bg-white border border-slate-200 text-slate-600 p-2 rounded-xl hover:bg-slate-50 shadow-sm transition-colors flex items-center justify-center h-9 w-9"
+                                    title={`Call ${h.name}`}
+                                  >
+                                    <Phone className="h-4 w-4 text-slate-500" />
+                                  </a>
+
+                                  {patientCoords && h.lat !== undefined && h.lng !== undefined && (
+                                    <a
+                                      href={`https://www.google.com/maps/dir/?api=1&origin=${patientCoords.lat},${patientCoords.lng}&destination=${h.lat},${h.lng}`}
+                                      target="_blank"
+                                      rel="noopener noreferrer"
+                                      className="bg-rose-600 text-white p-2 rounded-xl hover:bg-rose-700 shadow-sm transition-colors flex items-center justify-center h-9 w-9"
+                                      title="Get Directions"
+                                    >
+                                      <Navigation className="h-4 w-4" />
+                                    </a>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
                       </div>
-                    );
-                  })
+                    )}
+
+                    {/* Part 2: General / Other Closest Facilities */}
+                    <div className="space-y-3">
+                      {sortedAndFilteredHospitals.some(h => (h as any).activeDoctors && (h as any).activeDoctors.length > 0) && (
+                        <div className="text-[11px] font-black text-slate-500 tracking-wider uppercase pt-2 flex items-center gap-1.5">
+                          📍 GENERAL NEARBY HOSPITALS & CLINICS
+                        </div>
+                      )}
+                      {sortedAndFilteredHospitals
+                        .filter(h => !((h as any).activeDoctors && (h as any).activeDoctors.length > 0))
+                        .map((h, idx) => {
+                          const isHighlighted = hoveredHospitalId === h.id || hoveredHospitalId === `index-${idx}`;
+                          return (
+                            <div
+                              key={idx}
+                              className={`p-4 border rounded-3xl transition-all flex justify-between items-start text-xs ${
+                                isHighlighted
+                                  ? "border-emerald-500 bg-emerald-50/70 shadow-md ring-1 ring-emerald-500/20"
+                                  : "border-slate-100 bg-emerald-50/30 hover:bg-emerald-50/50"
+                              }`}
+                              onMouseEnter={() => setHoveredHospitalId(h.id || `index-${idx}`)}
+                              onMouseLeave={() => setHoveredHospitalId(null)}
+                            >
+                              <div className="space-y-1.5 flex-1 min-w-0 pr-3">
+                                <div className="flex items-center gap-2">
+                                  <span className="flex-shrink-0 w-5 h-5 rounded-full bg-emerald-600 text-white font-black text-[10px] flex items-center justify-center">
+                                    {idx + 1}
+                                  </span>
+                                  <h4 className="font-black text-emerald-950 text-sm truncate">{h.name}</h4>
+                                </div>
+
+                                <div className="flex items-center gap-1.5 text-[10px] font-bold text-slate-400">
+                                  <span>📍 {h.location}</span>
+                                  {h.distance !== undefined && h.distance !== Infinity && (
+                                    <span className="bg-emerald-100 text-emerald-900 px-1.5 py-0.5 rounded font-black text-[9px]">
+                                      {h.distance.toFixed(1)} km away
+                                    </span>
+                                  )}
+                                </div>
+
+                                <div className="flex gap-1 flex-wrap mt-1">
+                                  {h.specializations.map((spec, i) => (
+                                    <span
+                                      key={i}
+                                      className="text-[9px] bg-emerald-100/70 text-emerald-800 font-extrabold px-2 py-0.5 rounded-full"
+                                    >
+                                      {spec}
+                                    </span>
+                                  ))}
+                                </div>
+                              </div>
+
+                              <div className="flex gap-2">
+                                <a
+                                  href={`tel:${h.contact}`}
+                                  className="bg-white border border-slate-200 text-slate-600 p-2 rounded-xl hover:bg-slate-50 shadow-sm transition-colors flex items-center justify-center h-9 w-9"
+                                  title={`Call ${h.name}`}
+                                >
+                                  <Phone className="h-4 w-4 text-slate-500" />
+                                </a>
+
+                                {patientCoords && h.lat !== undefined && h.lng !== undefined && (
+                                  <a
+                                    href={`https://www.google.com/maps/dir/?api=1&origin=${patientCoords.lat},${patientCoords.lng}&destination=${h.lat},${h.lng}`}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="bg-emerald-600 text-white p-2 rounded-xl hover:bg-emerald-700 shadow-sm transition-colors flex items-center justify-center h-9 w-9"
+                                    title="Get Directions"
+                                  >
+                                    <Navigation className="h-4 w-4" />
+                                  </a>
+                                )}
+                              </div>
+                            </div>
+                          );
+                        })}
+                    </div>
+                  </>
                 )}
               </div>
             </div>
           )}
       </main>
+
+      {/* Detailed Doctor Profile & Booking Modal */}
+      {selectedDoctorForDetail && (() => {
+        const docHospital = hospitals.find(h => 
+          h.id === selectedDoctorForDetail.hospital_id || 
+          h.name.toLowerCase() === selectedDoctorForDetail.hospitalName?.toLowerCase()
+        );
+        const distance = docHospital && docHospital.lat !== undefined && docHospital.lng !== undefined && patientCoords
+          ? getHaversineDistance(patientCoords.lat, patientCoords.lng, docHospital.lat, docHospital.lng)
+          : null;
+
+        // Initials placeholder avatar
+        const initials = selectedDoctorForDetail.fullName
+          ? selectedDoctorForDetail.fullName.split(" ").map((n: string) => n[0]).join("").substring(0, 2).toUpperCase()
+          : "DR";
+
+        return (
+          <div className="fixed inset-0 z-50 bg-black/65 backdrop-blur-sm flex items-center justify-center p-4 overflow-y-auto">
+            <div className="bg-white rounded-3xl w-full max-w-lg p-6 max-h-[90vh] overflow-y-auto shadow-2xl animate-in fade-in zoom-in duration-250 flex flex-col gap-5 text-xs relative">
+              
+              {/* Close button */}
+              <button
+                onClick={() => setSelectedDoctorForDetail(null)}
+                className="absolute right-4 top-4 p-2 bg-slate-100 hover:bg-rose-50 hover:text-rose-600 rounded-full text-slate-500 transition-colors"
+              >
+                <X className="h-5 w-5" />
+              </button>
+
+              {/* Profile Header */}
+              <div className="flex gap-4 items-start pr-8">
+                <div className="w-16 h-16 rounded-full bg-rose-50 border border-rose-200 text-rose-700 font-black text-lg flex items-center justify-center tracking-wider shadow-sm flex-shrink-0">
+                  {initials}
+                </div>
+                <div className="space-y-1">
+                  <span className="bg-rose-50 text-rose-700 font-black text-[9px] px-2 py-0.5 rounded-full uppercase tracking-wider">
+                    {selectedDoctorForDetail.specialization || "Specialist"}
+                  </span>
+                  <h3 className="text-lg font-black text-slate-900">Dr. {selectedDoctorForDetail.fullName}</h3>
+                  <p className="font-extrabold text-slate-600">{selectedDoctorForDetail.qualification}</p>
+                  <p className="font-semibold text-slate-400">⭐ {selectedDoctorForDetail.rating || "4.8"} ({selectedDoctorForDetail.experience || 10} Years Experience)</p>
+                </div>
+              </div>
+
+              {/* Bio block */}
+              {selectedDoctorForDetail.bio && (
+                <div className="space-y-1.5 border-t pt-4">
+                  <h4 className="font-black text-slate-800 text-[11px] uppercase tracking-wider">About Doctor</h4>
+                  <p className="text-slate-500 font-medium leading-relaxed">{selectedDoctorForDetail.bio}</p>
+                </div>
+              )}
+
+              {/* Static Info fields */}
+              <div className="grid grid-cols-2 gap-3.5 bg-slate-50 p-4 rounded-2xl border border-slate-150">
+                <div>
+                  <span className="text-[10px] font-bold text-slate-400 uppercase">Consultation Fee</span>
+                  <div className="font-extrabold text-slate-900 text-sm">₹{selectedDoctorForDetail.consultationFee || 500}</div>
+                </div>
+                <div>
+                  <span className="text-[10px] font-bold text-slate-400 uppercase">Languages Spoken</span>
+                  <div className="font-extrabold text-slate-800 truncate">
+                    {Array.isArray(selectedDoctorForDetail.languages) 
+                      ? selectedDoctorForDetail.languages.join(", ") 
+                      : selectedDoctorForDetail.languages || "English"}
+                  </div>
+                </div>
+                <div>
+                  <span className="text-[10px] font-bold text-slate-400 uppercase">Available Days</span>
+                  <div className="font-extrabold text-slate-800">
+                    {Array.isArray(selectedDoctorForDetail.availableDays) 
+                      ? selectedDoctorForDetail.availableDays.join(", ") 
+                      : selectedDoctorForDetail.availableDays || "Mon - Fri"}
+                  </div>
+                </div>
+                <div>
+                  <span className="text-[10px] font-bold text-slate-400 uppercase">Time Slots</span>
+                  <div className="font-extrabold text-slate-800">{selectedDoctorForDetail.availableTime || "09:00 AM - 05:00 PM"}</div>
+                </div>
+              </div>
+
+              {/* Hospital Distance & Affiliation (GPS logic integration) */}
+              <div className="border-t pt-4 space-y-2">
+                <h4 className="font-black text-slate-800 text-[11px] uppercase tracking-wider">Hospital Affiliation & Proximity</h4>
+                <div className="bg-rose-50/50 border border-rose-100 p-3.5 rounded-2xl space-y-2">
+                  <div className="flex items-start gap-2.5">
+                    <span className="text-lg mt-0.5">🏥</span>
+                    <div>
+                      <div className="font-black text-slate-900">{selectedDoctorForDetail.hospitalName || "Partner Medical Facility"}</div>
+                      <div className="text-[10px] text-slate-400 font-bold">📍 {docHospital ? docHospital.location : "Location not listed"}</div>
+                    </div>
+                  </div>
+
+                  {/* Geolocation feedback */}
+                  <div className="flex items-center justify-between border-t border-rose-100 pt-2 text-[10px] font-bold">
+                    <span className="text-slate-500">Distance from you:</span>
+                    {distance !== null ? (
+                      <span className="text-rose-700 bg-rose-100/70 px-2 py-0.5 rounded-md flex items-center gap-1">
+                        🚀 <strong className="font-black">{distance.toFixed(1)} km</strong> (Reachable ✅)
+                      </span>
+                    ) : (
+                      <span className="text-slate-400 italic">Calculating distance...</span>
+                    )}
+                  </div>
+                </div>
+              </div>
+
+              {/* Booking inputs form inside modal */}
+              <div className="border-t pt-4 space-y-3.5">
+                <h4 className="font-black text-slate-800 text-[11px] uppercase tracking-wider">Book Scheduled Visit</h4>
+                <form 
+                  onSubmit={async (e) => {
+                    await handleBookAppointment(e);
+                  }} 
+                  className="space-y-3.5"
+                >
+                  <div>
+                    <label className="block text-[10px] font-black text-slate-500 uppercase mb-1">Preferred Date and Time</label>
+                    <input
+                      type="datetime-local"
+                      required
+                      value={appointmentDate}
+                      onChange={(e) => setAppointmentDate(e.target.value)}
+                      className="block w-full border border-slate-200 bg-slate-50 rounded-xl py-2 px-3 text-xs text-slate-800 font-bold focus:bg-white focus:ring-1 focus:ring-rose-500/20 focus:border-rose-500 outline-none transition-all"
+                    />
+                  </div>
+
+                  <div>
+                    <label className="block text-[10px] font-black text-slate-500 uppercase mb-1">Reason for Visit / Symptoms</label>
+                    <textarea
+                      rows={2}
+                      value={appointmentNotes}
+                      onChange={(e) => setAppointmentNotes(e.target.value)}
+                      placeholder="Specify your symptoms or notes for the doctor..."
+                      className="block w-full border border-slate-200 bg-slate-50 rounded-xl py-2 px-3 text-xs text-slate-800 font-medium placeholder-slate-400 focus:bg-white focus:ring-1 focus:ring-rose-500/20 focus:border-rose-500 outline-none transition-all"
+                    />
+                  </div>
+
+                  <div className="flex gap-2.5 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => setSelectedDoctorForDetail(null)}
+                      className="w-1/3 bg-slate-100 hover:bg-slate-200 text-slate-700 font-black py-3 rounded-xl tracking-wide transition-all cursor-pointer"
+                    >
+                      Cancel
+                    </button>
+                    <button
+                      type="submit"
+                      disabled={bookingLoading}
+                      className="w-2/3 bg-rose-500 hover:bg-rose-600 active:scale-95 text-white font-black py-3 rounded-xl tracking-wide transition-all shadow-md hover:shadow-lg disabled:opacity-50 cursor-pointer"
+                    >
+                      {bookingLoading ? "Booking appointment..." : "Confirm Booking"}
+                    </button>
+                  </div>
+
+                  {bookingStatus && (
+                    <div className="p-3 text-center rounded-xl font-bold bg-slate-50 border border-slate-150 text-slate-700 shadow-sm animate-pulse">
+                      {bookingStatus}
+                    </div>
+                  )}
+                </form>
+              </div>
+
+            </div>
+          </div>
+        );
+      })()}
 
       {/* Slide-Up Vitals Logging Modal */}
       {showLogModal && (
@@ -2314,21 +3607,29 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
                 </div>
               </div>
 
-              <button
-                onClick={handleLogVitals}
-                className="w-full bg-emerald-500 hover:bg-emerald-600 active:scale-95 text-white font-black py-3 rounded-2xl text-sm transition-all shadow-md mt-4"
-              >
-                💾 Save Vitals Info
-              </button>
+              <div className="flex flex-col gap-2 mt-4">
+                <button
+                  onClick={handleLogVitals}
+                  className="w-full bg-emerald-500 hover:bg-emerald-600 active:scale-95 text-white font-black py-3 rounded-2xl text-sm transition-all shadow-md cursor-pointer text-center"
+                >
+                  💾 Save Vitals Info
+                </button>
+                <button
+                  onClick={() => setShowLogModal(false)}
+                  className="w-full bg-slate-100 hover:bg-slate-200 active:scale-95 text-slate-600 font-bold py-2.5 rounded-2xl text-xs transition-all cursor-pointer text-center"
+                >
+                  ➡️ {t.skipVitals}
+                </button>
+              </div>
             </div>
           </div>
         </div>
       )}
 
-      {/* Details/Learn More Modal */}
+      {/* Details/Learn More Modal - slide up on mobile, centered on desktop */}
       {detailModalContent && (
-        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-white rounded-3xl w-full max-w-sm p-6 shadow-2xl relative animate-in zoom-in-95 duration-200">
+        <div className="fixed inset-0 z-50 bg-black/60 backdrop-blur-sm flex items-end sm:items-center justify-center p-4">
+          <div className="bg-white rounded-t-3xl sm:rounded-3xl w-full max-w-sm p-6 shadow-2xl relative animate-in slide-in-from-bottom sm:zoom-in-95 duration-200">
             <button
               onClick={() => setDetailModalContent(null)}
               className="absolute top-4 right-4 p-1.5 bg-slate-100 text-slate-500 rounded-full hover:bg-rose-50 hover:text-rose-600"
@@ -2347,8 +3648,8 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
         </div>
       )}
 
-      {/* Bottom Navigation Rail (Icon + Label) */}
-      <nav className="fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 py-2.5 px-1.5 sm:px-3 flex justify-around items-center z-40 shadow-xl max-w-lg mx-auto rounded-t-3xl">
+      {/* Bottom Navigation Rail (Icon + Label) - hidden on desktop (lg:) */}
+      <nav className="lg:hidden fixed bottom-0 left-0 right-0 bg-white border-t border-slate-200 py-2.5 px-1.5 sm:px-3 flex justify-around items-center z-40 shadow-xl max-w-lg mx-auto rounded-t-3xl">
         <button
           onClick={() => setActiveTab("vitals")}
           className={`flex flex-col items-center gap-0.5 transition-all flex-1 min-w-0 ${activeTab === "vitals" ? "text-rose-500 scale-105" : "text-slate-400 hover:text-slate-600"}`}
@@ -2405,6 +3706,58 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
           <span className="text-[8px] sm:text-[10px] font-black truncate w-full text-center">{tabNames[lang].ai}</span>
         </button>
       </nav>
+
+      {/* Floating Real-Time Notification Toasts */}
+      <div id="toasts-container" className="fixed bottom-24 right-6 z-50 flex flex-col gap-3 max-w-sm w-full">
+        {toasts.map((toast) => (
+          <div
+            key={toast.id}
+            id={`toast-${toast.id}`}
+            className={`p-4 rounded-2xl shadow-xl border flex flex-col gap-2 transition-all duration-300 animate-slide-in ${
+              toast.is_emergency
+                ? "bg-rose-50 border-rose-300 shadow-rose-100 ring-4 ring-rose-500/10"
+                : "bg-white border-slate-200 shadow-slate-100"
+            }`}
+          >
+            <div className="flex justify-between items-start">
+              <div className="flex items-center gap-2">
+                {getNotificationIcon(toast.type)}
+                <span className={`text-xs font-black uppercase tracking-wider ${
+                  toast.is_emergency ? "text-rose-600 animate-pulse" : "text-slate-500"
+                }`}>
+                  {toast.is_emergency ? "🚨 Critical Emergency" : "Notification"}
+                </span>
+              </div>
+              <button
+                onClick={() => {
+                  setToasts(prev => prev.filter(t => t.id !== toast.id));
+                }}
+                className="text-slate-400 hover:text-slate-600 transition-colors text-sm cursor-pointer"
+              >
+                ✕
+              </button>
+            </div>
+            
+            <p className={`text-xs font-bold leading-relaxed ${toast.is_emergency ? "text-rose-950" : "text-slate-800"}`}>
+              {toast.message}
+            </p>
+
+            {toast.is_emergency ? (
+              <button
+                onClick={() => {
+                  setToasts(prev => prev.filter(t => t.id !== toast.id));
+                  handleMarkAsRead(toast.id);
+                }}
+                className="bg-rose-600 hover:bg-rose-700 text-white font-black py-2 rounded-xl text-xs transition-all shadow-sm active:scale-95 cursor-pointer mt-1 text-center"
+              >
+                Acknowledge & Dismiss
+              </button>
+            ) : null}
+          </div>
+        ))}
+      </div>
+
+      </div> {/* Closing Main Workspace Frame */}
     </div>
   );
 }

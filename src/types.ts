@@ -17,6 +17,16 @@ export interface UserProfile {
   state?: string;
   // Doctor fields
   specialization?: string;
+  qualification?: string;
+  experience?: number;
+  hospital_id?: string;
+  hospitalName?: string;
+  consultationFee?: number;
+  languages?: string[];
+  availableDays?: string[];
+  availableTime?: string;
+  rating?: number;
+  bio?: string;
   createdAt: string;
 }
 

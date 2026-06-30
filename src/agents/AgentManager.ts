@@ -99,7 +99,11 @@ export class AgentManager implements AgentManagerInterface {
   public async logInvocation(log: Omit<AgentLog, "id">): Promise<void> {
     console.log(`[AgentManager Log] Agent: ${log.agentName} | Event: ${log.eventType} | Status: ${log.status}`);
     try {
-      await addDoc(collection(db, "agent_logs"), log);
+      const cleanLog: any = { ...log };
+      if (cleanLog.error === undefined) {
+        delete cleanLog.error;
+      }
+      await addDoc(collection(db, "agent_logs"), cleanLog);
     } catch (err) {
       handleFirestoreError(err, OperationType.WRITE, "agent_logs");
     }
