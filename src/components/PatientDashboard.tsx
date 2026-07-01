@@ -72,7 +72,9 @@ import {
   Bell,
   CheckCheck,
   Calendar,
-  UserCheck
+  UserCheck,
+  Volume2,
+  VolumeX
 } from "lucide-react";
 
 function evaluateSchemeEligibility(scheme: GovernmentScheme, profile: UserProfile): {
@@ -408,7 +410,20 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
 
   const handleMarkAsRead = async (id: string) => {
     try {
-      await updateDoc(doc(db, "notifications", id), { read: true });
+      if (profile.uid.startsWith("demo-")) {
+        const localNotifs = localStorage.getItem(`notifications_${profile.uid}`);
+        if (localNotifs) {
+          const parsed = JSON.parse(localNotifs);
+          const updated = parsed.map((n: any) => n.id === id ? { ...n, read: true } : n);
+          localStorage.setItem(`notifications_${profile.uid}`, JSON.stringify(updated));
+          setNotifications(updated);
+        }
+      }
+      try {
+        await updateDoc(doc(db, "notifications", id), { read: true });
+      } catch (firestoreErr) {
+        console.warn("Could not mark notification as read on Firestore:", firestoreErr);
+      }
     } catch (err) {
       console.error("Error marking notification as read:", err);
     }
@@ -416,9 +431,22 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
 
   const handleMarkAllAsRead = async () => {
     try {
+      if (profile.uid.startsWith("demo-")) {
+        const localNotifs = localStorage.getItem(`notifications_${profile.uid}`);
+        if (localNotifs) {
+          const parsed = JSON.parse(localNotifs);
+          const updated = parsed.map((n: any) => ({ ...n, read: true }));
+          localStorage.setItem(`notifications_${profile.uid}`, JSON.stringify(updated));
+          setNotifications(updated);
+        }
+      }
       const unread = notifications.filter(n => !n.read);
       for (const n of unread) {
-        await updateDoc(doc(db, "notifications", n.id), { read: true });
+        try {
+          await updateDoc(doc(db, "notifications", n.id), { read: true });
+        } catch (firestoreErr) {
+          console.warn("Could not mark notification as read on Firestore:", firestoreErr);
+        }
       }
     } catch (err) {
       console.error("Error marking all notifications as read:", err);
@@ -508,6 +536,119 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
   const [bloodContact, setBloodContact] = useState("");
   const [bloodLoading, setBloodLoading] = useState(false);
 
+  // States for simplified schemes and Speech Synthesis
+  const [simplifiedSchemes, setSimplifiedSchemes] = useState<Record<string, string>>({});
+  const [simplifyingSchemeIds, setSimplifyingSchemeIds] = useState<string[]>([]);
+  const [speakingSchemeId, setSpeakingSchemeId] = useState<string | null>(null);
+
+  useEffect(() => {
+    // Cancel speaking when active tab changes
+    if (typeof window !== "undefined" && "speechSynthesis" in window) {
+      window.speechSynthesis.cancel();
+    }
+    setSpeakingSchemeId(null);
+  }, [activeTab]);
+
+  const handleSimplifyScheme = async (scheme: GovernmentScheme) => {
+    const schemeKey = scheme.id || scheme.name;
+    if (simplifiedSchemes[schemeKey]) {
+      // Toggle display off if already simplified
+      setSimplifiedSchemes(prev => {
+        const next = { ...prev };
+        delete next[schemeKey];
+        return next;
+      });
+      return;
+    }
+
+    setSimplifyingSchemeIds(prev => [...prev, schemeKey]);
+    try {
+      const res = await fetch("/api/gemini/simplify-scheme", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          language: lang,
+          schemeName: scheme.name,
+          description: scheme.description,
+          benefits: scheme.benefits,
+          eligibility: scheme.eligibility_summary
+        })
+      });
+      const data = await res.json();
+      setSimplifiedSchemes(prev => ({
+        ...prev,
+        [schemeKey]: data.text
+      }));
+    } catch (err) {
+      console.warn("Error simplifying scheme:", err);
+      // Fallback
+      const fallbackText = lang === "hi" 
+        ? `📋 **${scheme.name} का आसान विवरण**:\n- 🎁 **लाभ**: ${scheme.benefits}\n- 🎯 **किसे मिलेगा**: ${scheme.eligibility_summary}\n- 🚶‍♂️ **कदम**: अधिक जानकारी के लिए आधिकारिक लिंक पर जाएं।`
+        : lang === "te"
+        ? `📋 **${scheme.name} యొక్క సులభమైన వివరణ**:\n- 🎁 **ప్రయోజనాలు**: ${scheme.benefits}\n- 🎯 **అర్హత**: ${scheme.eligibility_summary}\n- 🚶‍♂️ **దశలు**: మరింత సమాచారం కోసం అధికారిక లింకును చూడండి.`
+        : `📋 **${scheme.name} Simple Guide**:\n- 🎁 **Benefits**: ${scheme.benefits}\n- 🎯 **Eligibility**: ${scheme.eligibility_summary}\n- 🚶‍♂️ **Steps**: View official link details to register.`;
+      setSimplifiedSchemes(prev => ({
+        ...prev,
+        [schemeKey]: fallbackText
+      }));
+    } finally {
+      setSimplifyingSchemeIds(prev => prev.filter(id => id !== schemeKey));
+    }
+  };
+
+  const handleSpeakScheme = (scheme: GovernmentScheme) => {
+    const schemeKey = scheme.id || scheme.name;
+    if ("speechSynthesis" in window) {
+      if (speakingSchemeId) {
+        window.speechSynthesis.cancel();
+        if (speakingSchemeId === schemeKey) {
+          setSpeakingSchemeId(null);
+          return;
+        }
+      }
+
+      // Check if there is simplified text available, read that instead as it is easier to understand!
+      const rawTextToClean = simplifiedSchemes[schemeKey] || 
+        `${scheme.name}. ${scheme.description}. Benefits: ${scheme.benefits}. Eligibility: ${scheme.eligibility_summary}`;
+
+      const textToRead = rawTextToClean
+        .replace(/[*#`•🎁🎯📋🚶‍♂️💰]/g, "") // Clean markdown tags and emojis
+        .trim();
+
+      const utterance = new SpeechSynthesisUtterance(textToRead);
+      
+      // Select appropriate voice based on lang
+      const voices = window.speechSynthesis.getVoices();
+      let selectedVoice = null;
+      if (lang === "hi") {
+        selectedVoice = voices.find(v => v.lang.startsWith("hi"));
+      } else if (lang === "te") {
+        selectedVoice = voices.find(v => v.lang.startsWith("te"));
+      } else {
+        selectedVoice = voices.find(v => v.lang.startsWith("en-IN") || v.lang.startsWith("en"));
+      }
+
+      if (selectedVoice) {
+        utterance.voice = selectedVoice;
+      }
+      
+      utterance.lang = lang === "hi" ? "hi-IN" : lang === "te" ? "te-IN" : "en-IN";
+      utterance.rate = 0.85; // Speak clearly
+
+      utterance.onend = () => {
+        setSpeakingSchemeId(null);
+      };
+      utterance.onerror = () => {
+        setSpeakingSchemeId(null);
+      };
+
+      setSpeakingSchemeId(schemeKey);
+      window.speechSynthesis.speak(utterance);
+    } else {
+      alert("Speech synthesis is not supported in your browser.");
+    }
+  };
+
   // AI assistant chat state
   const [chatInput, setChatInput] = useState("");
   const [chatMessages, setChatMessages] = useState<{ 
@@ -541,6 +682,102 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
   useEffect(() => {
     if (!profile.uid) return;
 
+    // Pre-populate and initialize local storage for demo patient immediately on mount
+    if (profile.uid.startsWith("demo-")) {
+      const localVitalsKey = `vitals_${profile.uid}`;
+      const localNotifsKey = `notifications_${profile.uid}`;
+      const localAlertsKey = `alerts_${profile.uid}`;
+
+      if (!localStorage.getItem(localVitalsKey)) {
+        const initialDemoVitals: VitalsRecord[] = [
+          {
+            id: "v-1",
+            patient_id: profile.uid,
+            timestamp: new Date(Date.now() - 3600000 * 2).toISOString(), // 2 hours ago
+            readings: {
+              heartRate: 74,
+              systolic: 122,
+              diastolic: 81,
+              oxygenLevel: 98,
+              temperature: 36.8,
+              loggedBy: "patient"
+            },
+            risk_level: "low"
+          },
+          {
+            id: "v-2",
+            patient_id: profile.uid,
+            timestamp: new Date(Date.now() - 3600000 * 24).toISOString(), // 1 day ago
+            readings: {
+              heartRate: 85,
+              systolic: 138,
+              diastolic: 88,
+              oxygenLevel: 96,
+              temperature: 37.2,
+              loggedBy: "patient"
+            },
+            risk_level: "medium"
+          },
+          {
+            id: "v-3",
+            patient_id: profile.uid,
+            timestamp: new Date(Date.now() - 3600000 * 48).toISOString(), // 2 days ago
+            readings: {
+              heartRate: 71,
+              systolic: 118,
+              diastolic: 79,
+              oxygenLevel: 99,
+              temperature: 36.6,
+              loggedBy: "patient"
+            },
+            risk_level: "low"
+          }
+        ];
+        localStorage.setItem(localVitalsKey, JSON.stringify(initialDemoVitals));
+        setVitals(initialDemoVitals);
+      } else {
+        try {
+          setVitals(JSON.parse(localStorage.getItem(localVitalsKey)!));
+        } catch (e) {
+          console.error("Failed to parse local vitals", e);
+        }
+      }
+
+      if (!localStorage.getItem(localNotifsKey)) {
+        const initialDemoNotifs = [
+          {
+            id: "notif-init-1",
+            recipient_id: profile.uid,
+            recipient_role: "patient",
+            type: "appointment",
+            message: "📅 Appointment with Dr. Anjali Sharma confirmed for tomorrow at 10:00 AM.",
+            read: false,
+            created_at: new Date(Date.now() - 3600000 * 4).toISOString()
+          }
+        ];
+        localStorage.setItem(localNotifsKey, JSON.stringify(initialDemoNotifs));
+        setNotifications(initialDemoNotifs);
+      } else {
+        try {
+          setNotifications(JSON.parse(localStorage.getItem(localNotifsKey)!));
+        } catch (e) {
+          console.error("Failed to parse local notifications", e);
+        }
+      }
+
+      if (!localStorage.getItem(localAlertsKey)) {
+        const initialDemoAlerts: HealthAlert[] = [];
+        localStorage.setItem(localAlertsKey, JSON.stringify(initialDemoAlerts));
+        setAlerts(initialDemoAlerts);
+      } else {
+        try {
+          setAlerts(JSON.parse(localStorage.getItem(localAlertsKey)!));
+        } catch (e) {
+          console.error("Failed to parse local alerts", e);
+        }
+      }
+    }
+
     // 1. Subscribe to patient vitals
     const vitalsQ = query(
       collection(db, "vitals"),
@@ -549,9 +786,27 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
     const unsubVitals = onSnapshot(vitalsQ, (snap) => {
       const records = snap.docs.map(doc => ({ id: doc.id, ...doc.data() })) as VitalsRecord[];
       records.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-      setVitals(records);
+      
+      if (profile.uid.startsWith("demo-")) {
+        const localVitals = localStorage.getItem(`vitals_${profile.uid}`);
+        const localRecords = localVitals ? JSON.parse(localVitals) : [];
+        const combined = [...records];
+        for (const local of localRecords) {
+          if (!combined.some(c => c.timestamp === local.timestamp)) {
+            combined.push(local);
+          }
+        }
+        combined.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+        setVitals(combined);
+      } else {
+        setVitals(records);
+      }
     }, (err) => {
       console.warn("Vitals subscription failed:", err);
+      if (profile.uid.startsWith("demo-")) {
+        const localVitals = localStorage.getItem(`vitals_${profile.uid}`);
+        if (localVitals) setVitals(JSON.parse(localVitals));
+      }
     });
 
     // 2. Subscribe to caretaker relations
@@ -599,9 +854,27 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
     const unsubAlerts = onSnapshot(alertsQ, (snap) => {
       const records = snap.docs.map(doc => ({ id: doc.id, ...doc.data() })) as HealthAlert[];
       records.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
-      setAlerts(records);
+      
+      if (profile.uid.startsWith("demo-")) {
+        const localAlerts = localStorage.getItem(`alerts_${profile.uid}`);
+        const localRecords = localAlerts ? JSON.parse(localAlerts) : [];
+        const combined = [...records];
+        for (const local of localRecords) {
+          if (!combined.some(c => c.timestamp === local.timestamp)) {
+            combined.push(local);
+          }
+        }
+        combined.sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+        setAlerts(combined);
+      } else {
+        setAlerts(records);
+      }
     }, (err) => {
       console.warn("Alerts subscription failed:", err);
+      if (profile.uid.startsWith("demo-")) {
+        const localAlerts = localStorage.getItem(`alerts_${profile.uid}`);
+        if (localAlerts) setAlerts(JSON.parse(localAlerts));
+      }
     });
 
     // 6. Subscribe to blood requests/donors
@@ -649,7 +922,22 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
     let isInitialLoad = true;
     const unsubNotifications = onSnapshot(notificationsQ, (snap) => {
       const records = snap.docs.map(doc => ({ id: doc.id, ...doc.data() })) as any[];
-      setNotifications(records);
+      
+      let mergedRecords = records;
+      if (profile.uid.startsWith("demo-")) {
+        const localNotifs = localStorage.getItem(`notifications_${profile.uid}`);
+        const localRecords = localNotifs ? JSON.parse(localNotifs) : [];
+        const combined = [...records];
+        for (const local of localRecords) {
+          if (!combined.some(c => c.id === local.id || c.created_at === local.created_at)) {
+            combined.push(local);
+          }
+        }
+        combined.sort((a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime());
+        mergedRecords = combined;
+      }
+      
+      setNotifications(mergedRecords);
 
       if (!isInitialLoad) {
         snap.docChanges().forEach((change) => {
@@ -675,6 +963,10 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
       isInitialLoad = false;
     }, (err) => {
       console.warn("Notifications subscription failed:", err);
+      if (profile.uid.startsWith("demo-")) {
+        const localNotifs = localStorage.getItem(`notifications_${profile.uid}`);
+        if (localNotifs) setNotifications(JSON.parse(localNotifs));
+      }
     });
 
     // Load static modules
@@ -1130,7 +1422,23 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
         risk_level: risk
       };
 
-      await addDoc(collection(db, "vitals"), newRecord);
+      // Support instant offline/demo storage
+      if (profile.uid.startsWith("demo-")) {
+        const localVitalsKey = `vitals_${profile.uid}`;
+        const existingLocal = localStorage.getItem(localVitalsKey);
+        const localRecords = existingLocal ? JSON.parse(existingLocal) : [];
+        const updatedLocal = [{ id: "temp-" + Date.now(), ...newRecord }, ...localRecords];
+        localStorage.setItem(localVitalsKey, JSON.stringify(updatedLocal));
+        setVitals(updatedLocal);
+      }
+
+      // Try to save to Firestore backend, but do not block the UI if it times out or fails
+      try {
+        await addDoc(collection(db, "vitals"), newRecord);
+      } catch (firestoreErr) {
+        console.warn("Could not save vitals to Firestore backend (offline fallback active):", firestoreErr);
+      }
+
       setShowLogModal(false);
 
       // Trigger real-time notifications to all linked accepted caretakers
@@ -1143,61 +1451,110 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
         const caretakersSnap = await getDocs(caretakersQuery);
         for (const ctDoc of caretakersSnap.docs) {
           const ct = ctDoc.data();
-          await addDoc(collection(db, "notifications"), {
-            recipient_id: ct.caretaker_id,
-            recipient_role: "caretaker",
-            type: "vitals_log",
-            message: `📊 Patient ${profile.fullName} logged new vitals (Risk: ${risk.toUpperCase()}). HR: ${heartRate} bpm, BP: ${systolic}/${diastolic}, O2: ${oxygenLevel}%, Temp: ${temperature}°C`,
-            related_id: profile.uid,
-            read: false,
-            created_at: new Date().toISOString()
-          });
+          try {
+            await addDoc(collection(db, "notifications"), {
+              recipient_id: ct.caretaker_id,
+              recipient_role: "caretaker",
+              type: "vitals_log",
+              message: `📊 Patient ${profile.fullName} logged new vitals (Risk: ${risk.toUpperCase()}). HR: ${heartRate} bpm, BP: ${systolic}/${diastolic}, O2: ${oxygenLevel}%, Temp: ${temperature}°C`,
+              related_id: profile.uid,
+              read: false,
+              created_at: new Date().toISOString()
+            });
+          } catch (notifErr) {
+            console.warn("Could not save caretaker notification to Firestore:", notifErr);
+          }
         }
       } catch (err) {
         console.error("Error creating caretaker vitals logged notification:", err);
       }
 
       // Trigger the AI Agents Layer!
-      await agentManager.dispatchEvent({
-        type: "VITALS_UPDATED",
-        patientId: profile.uid,
-        data: {
-          heartRate,
-          systolic,
-          diastolic,
-          oxygenLevel,
-          temperature,
-          patientName: profile.fullName,
-          language: lang,
-          patientCoords,
-          state: profile.state
-        }
-      });
+      try {
+        await agentManager.dispatchEvent({
+          type: "VITALS_UPDATED",
+          patientId: profile.uid,
+          data: {
+            heartRate,
+            systolic,
+            diastolic,
+            oxygenLevel,
+            temperature,
+            patientName: profile.fullName,
+            language: lang,
+            patientCoords,
+            state: profile.state
+          }
+        });
+      } catch (agentErr) {
+        console.warn("Could not dispatch event to agent manager:", agentErr);
+      }
 
       // Create a persistent alert if risk is medium
       // If it's high, HealthMonitoringAgent will trigger RISK_LEVEL_CRITICAL and EmergencyResponseAgent will log/alert
       if (risk === "medium") {
         const message = `Alert: Vitals are outside normal parameters. Please check-in and rest.`;
-        const alertRef = await addDoc(collection(db, "alerts"), {
-          patient_id: profile.uid,
-          patient_name: profile.fullName,
-          type: oxygenLevel < 92 ? "oxygen" : systolic > 135 ? "blood_pressure" : "heart_rate",
-          severity: "medium",
-          message,
-          timestamp: new Date().toISOString(),
-          resolved: false
-        });
+        
+        if (profile.uid.startsWith("demo-")) {
+          // Instant local alert and notification support
+          const alertId = "alert-" + Date.now();
+          const newAlert: HealthAlert = {
+            id: alertId,
+            patient_id: profile.uid,
+            patient_name: profile.fullName,
+            type: oxygenLevel < 92 ? "oxygen" : systolic > 135 ? "blood_pressure" : "heart_rate",
+            severity: "medium",
+            message,
+            timestamp: new Date().toISOString(),
+            resolved: false
+          };
+          const existingAlerts = localStorage.getItem(`alerts_${profile.uid}`);
+          const alertRecords = existingAlerts ? JSON.parse(existingAlerts) : [];
+          const updatedAlerts = [newAlert, ...alertRecords];
+          localStorage.setItem(`alerts_${profile.uid}`, JSON.stringify(updatedAlerts));
+          setAlerts(updatedAlerts);
 
-        // Notify patient of their alert
-        await addDoc(collection(db, "notifications"), {
-          recipient_id: profile.uid,
-          recipient_role: "patient",
-          type: "alert",
-          message: `⚠️ Vitals Alert: ${message}`,
-          related_id: alertRef.id,
-          read: false,
-          created_at: new Date().toISOString()
-        });
+          const newNotification = {
+            id: "notif-" + Date.now(),
+            recipient_id: profile.uid,
+            recipient_role: "patient",
+            type: "alert",
+            message: `⚠️ Vitals Alert: ${message}`,
+            related_id: alertId,
+            read: false,
+            created_at: new Date().toISOString()
+          };
+          const existingNotifs = localStorage.getItem(`notifications_${profile.uid}`);
+          const notifRecords = existingNotifs ? JSON.parse(existingNotifs) : [];
+          const updatedNotifs = [newNotification, ...notifRecords];
+          localStorage.setItem(`notifications_${profile.uid}`, JSON.stringify(updatedNotifs));
+          setNotifications(updatedNotifs);
+        }
+
+        try {
+          const alertRef = await addDoc(collection(db, "alerts"), {
+            patient_id: profile.uid,
+            patient_name: profile.fullName,
+            type: oxygenLevel < 92 ? "oxygen" : systolic > 135 ? "blood_pressure" : "heart_rate",
+            severity: "medium",
+            message,
+            timestamp: new Date().toISOString(),
+            resolved: false
+          });
+
+          // Notify patient of their alert
+          await addDoc(collection(db, "notifications"), {
+            recipient_id: profile.uid,
+            recipient_role: "patient",
+            type: "alert",
+            message: `⚠️ Vitals Alert: ${message}`,
+            related_id: alertRef.id,
+            read: false,
+            created_at: new Date().toISOString()
+          });
+        } catch (alertErr) {
+          console.warn("Could not save alert/notification to Firestore:", alertErr);
+        }
       }
     } catch (e) {
       console.error("Error logging vitals", e);
@@ -2884,17 +3241,64 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
                                   💰 Income criteria: Confirm annual household income is below ₹{s.income_limit?.toLocaleString()}
                                 </p>
                               )}
-                              <p className="text-[11px] text-slate-700 font-semibold mb-2">{s.description}</p>
-                              <div className="flex justify-between items-center flex-wrap gap-2 pt-1 border-t border-slate-200/50">
+                              {simplifiedSchemes[s.id || s.name] ? (
+                                <div className="mt-2.5 mb-2 p-3.5 bg-indigo-50/70 border border-indigo-100 rounded-2xl text-[11px] text-indigo-950 font-medium whitespace-pre-line leading-relaxed shadow-inner">
+                                  <div className="text-[11px] font-black text-indigo-800 mb-1 flex items-center gap-1">
+                                    <Sparkles className="h-3 w-3 text-indigo-500 animate-pulse" />
+                                    <span>✨ AI Simplified Version (Easy to Understand):</span>
+                                  </div>
+                                  {simplifiedSchemes[s.id || s.name]}
+                                </div>
+                              ) : (
+                                <p className="text-[11px] text-slate-700 font-semibold mb-2">{s.description}</p>
+                              )}
+                              <div className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-slate-200/50">
                                 <span className="text-[10px] text-emerald-700 font-extrabold bg-emerald-100/30 px-2 py-0.5 rounded-md">🎁 Benefits: {s.benefits}</span>
-                                <a
-                                  href={s.official_link}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className="inline-flex items-center gap-1 bg-white border border-slate-200 text-slate-700 px-3 py-1 rounded-xl text-[10px] font-black hover:bg-slate-100 shadow-sm transition-colors"
-                                >
-                                  Official Link <ChevronRight className="h-3 w-3" />
-                                </a>
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  <button
+                                    onClick={() => handleSimplifyScheme(s)}
+                                    className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-xl text-[10px] font-black transition-all ${
+                                      simplifiedSchemes[s.id || s.name]
+                                        ? "bg-indigo-100 text-indigo-700 hover:bg-indigo-200 border border-indigo-200"
+                                        : "bg-indigo-50 hover:bg-indigo-100 text-indigo-600 border border-indigo-100"
+                                    }`}
+                                  >
+                                    <Sparkles className={`h-3 w-3 ${simplifyingSchemeIds.includes(s.id || s.name) ? "animate-spin" : ""}`} />
+                                    {simplifyingSchemeIds.includes(s.id || s.name)
+                                      ? "Simplifying..."
+                                      : simplifiedSchemes[s.id || s.name]
+                                      ? "Original"
+                                      : "✨ Easy Read"}
+                                  </button>
+                                  <button
+                                    onClick={() => handleSpeakScheme(s)}
+                                    className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-xl text-[10px] font-black transition-all ${
+                                      speakingSchemeId === (s.id || s.name)
+                                        ? "bg-amber-100 text-amber-700 hover:bg-amber-200 border border-amber-200 animate-pulse"
+                                        : "bg-amber-50 hover:bg-amber-100 text-amber-600 border border-amber-100"
+                                    }`}
+                                  >
+                                    {speakingSchemeId === (s.id || s.name) ? (
+                                      <>
+                                        <VolumeX className="h-3.5 w-3.5" />
+                                        Stop
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Volume2 className="h-3.5 w-3.5" />
+                                        🔊 Listen
+                                      </>
+                                    )}
+                                  </button>
+                                  <a
+                                    href={s.official_link}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-1 bg-white border border-slate-200 text-slate-700 px-3 py-1 rounded-xl text-[10px] font-black hover:bg-slate-100 shadow-sm transition-colors"
+                                  >
+                                    Official Link <ChevronRight className="h-3 w-3" />
+                                  </a>
+                                </div>
                               </div>
                             </div>
                           );
@@ -2934,17 +3338,64 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
                                   ⚠️ Status: {evalRes.reasons.join(", ")}
                                 </p>
                               )}
-                              <p className="text-[11px] text-slate-600 font-semibold mb-2">{s.description}</p>
-                              <div className="flex justify-between items-center flex-wrap gap-2 pt-1 border-t border-slate-200/50">
+                              {simplifiedSchemes[s.id || s.name] ? (
+                                <div className="mt-2.5 mb-2 p-3.5 bg-indigo-50/70 border border-indigo-100 rounded-2xl text-[11px] text-indigo-950 font-medium whitespace-pre-line leading-relaxed shadow-inner">
+                                  <div className="text-[11px] font-black text-indigo-800 mb-1 flex items-center gap-1">
+                                    <Sparkles className="h-3 w-3 text-indigo-500 animate-pulse" />
+                                    <span>✨ AI Simplified Version (Easy to Understand):</span>
+                                  </div>
+                                  {simplifiedSchemes[s.id || s.name]}
+                                </div>
+                              ) : (
+                                <p className="text-[11px] text-slate-600 font-semibold mb-2">{s.description}</p>
+                              )}
+                              <div className="flex flex-wrap items-center justify-between gap-2 pt-1.5 border-t border-slate-200/50">
                                 <span className="text-[10px] text-amber-700 font-extrabold bg-amber-100/20 px-2 py-0.5 rounded-md">🎁 Benefits: {s.benefits}</span>
-                                <a
-                                  href={s.official_link}
-                                  target="_blank"
-                                  rel="noopener noreferrer"
-                                  className="inline-flex items-center gap-1 bg-white border border-slate-200 text-slate-700 px-3 py-1 rounded-xl text-[10px] font-black hover:bg-slate-100 shadow-sm transition-colors"
-                                >
-                                  Official Link <ChevronRight className="h-3 w-3" />
-                                </a>
+                                <div className="flex items-center gap-1.5 flex-wrap">
+                                  <button
+                                    onClick={() => handleSimplifyScheme(s)}
+                                    className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-xl text-[10px] font-black transition-all ${
+                                      simplifiedSchemes[s.id || s.name]
+                                        ? "bg-indigo-100 text-indigo-700 hover:bg-indigo-200 border border-indigo-200"
+                                        : "bg-indigo-50 hover:bg-indigo-100 text-indigo-600 border border-indigo-100"
+                                    }`}
+                                  >
+                                    <Sparkles className={`h-3 w-3 ${simplifyingSchemeIds.includes(s.id || s.name) ? "animate-spin" : ""}`} />
+                                    {simplifyingSchemeIds.includes(s.id || s.name)
+                                      ? "Simplifying..."
+                                      : simplifiedSchemes[s.id || s.name]
+                                      ? "Original"
+                                      : "✨ Easy Read"}
+                                  </button>
+                                  <button
+                                    onClick={() => handleSpeakScheme(s)}
+                                    className={`inline-flex items-center gap-1 px-2.5 py-1 rounded-xl text-[10px] font-black transition-all ${
+                                      speakingSchemeId === (s.id || s.name)
+                                        ? "bg-amber-100 text-amber-700 hover:bg-amber-200 border border-amber-200 animate-pulse"
+                                        : "bg-amber-50 hover:bg-amber-100 text-amber-600 border border-amber-100"
+                                    }`}
+                                  >
+                                    {speakingSchemeId === (s.id || s.name) ? (
+                                      <>
+                                        <VolumeX className="h-3.5 w-3.5" />
+                                        Stop
+                                      </>
+                                    ) : (
+                                      <>
+                                        <Volume2 className="h-3.5 w-3.5" />
+                                        🔊 Listen
+                                      </>
+                                    )}
+                                  </button>
+                                  <a
+                                    href={s.official_link}
+                                    target="_blank"
+                                    rel="noopener noreferrer"
+                                    className="inline-flex items-center gap-1 bg-white border border-slate-200 text-slate-700 px-3 py-1 rounded-xl text-[10px] font-black hover:bg-slate-100 shadow-sm transition-colors"
+                                  >
+                                    Official Link <ChevronRight className="h-3 w-3" />
+                                  </a>
+                                </div>
                               </div>
                             </div>
                           );
@@ -2967,17 +3418,43 @@ export default function PatientDashboard({ profile, onLogout }: PatientDashboard
                             {s.category}
                           </span>
                         </div>
-                        <p className="text-slate-500 font-medium line-clamp-2 mb-1">{s.description}</p>
-                        <div className="flex justify-between items-center text-[9px] mt-1.5">
+                        {simplifiedSchemes[s.id || s.name] ? (
+                          <div className="mt-2 mb-2 p-2.5 bg-indigo-50/70 border border-indigo-100 rounded-xl text-[10px] text-indigo-950 font-medium whitespace-pre-line leading-relaxed shadow-inner">
+                            <div className="text-[10px] font-black text-indigo-800 mb-0.5 flex items-center gap-1">
+                              <Sparkles className="h-3 w-3 text-indigo-500" />
+                              <span>✨ AI Simplified Version:</span>
+                            </div>
+                            {simplifiedSchemes[s.id || s.name]}
+                          </div>
+                        ) : (
+                          <p className="text-slate-500 font-medium line-clamp-2 mb-1">{s.description}</p>
+                        )}
+                        <div className="flex flex-wrap items-center justify-between gap-1.5 text-[9px] mt-1.5 pt-1.5 border-t border-slate-200/40">
                           <span className="text-indigo-600 font-bold">📍 Coverage: {s.applicable_states.join(", ")}</span>
-                          <a
-                            href={s.official_link}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="text-indigo-600 font-black hover:underline"
-                          >
-                            Official Link →
-                          </a>
+                          <div className="flex items-center gap-1.5">
+                            <button
+                              onClick={() => handleSimplifyScheme(s)}
+                              className="text-indigo-600 font-black hover:underline inline-flex items-center gap-0.5 cursor-pointer"
+                            >
+                              <Sparkles className="h-2.5 w-2.5" />
+                              {simplifiedSchemes[s.id || s.name] ? "Original" : "Easy Read"}
+                            </button>
+                            <button
+                              onClick={() => handleSpeakScheme(s)}
+                              className="text-amber-600 font-black hover:underline inline-flex items-center gap-0.5 cursor-pointer"
+                            >
+                              <Volume2 className="h-2.5 w-2.5" />
+                              {speakingSchemeId === (s.id || s.name) ? "Stop" : "🔊 Listen"}
+                            </button>
+                            <a
+                              href={s.official_link}
+                              target="_blank"
+                              rel="noopener noreferrer"
+                              className="text-indigo-600 font-black hover:underline"
+                            >
+                              Official Link →
+                            </a>
+                          </div>
                         </div>
                       </div>
                     ))}

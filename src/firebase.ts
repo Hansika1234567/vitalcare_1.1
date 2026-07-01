@@ -8,6 +8,8 @@ import {
 } from "firebase/auth";
 import { 
   initializeFirestore, 
+  persistentLocalCache, 
+  persistentMultipleTabManager,
   collection, 
   doc, 
   setDoc, 
@@ -31,7 +33,11 @@ const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 const databaseId = (firebaseConfig as any).firestoreDatabaseId || "(default)";
 export const db = initializeFirestore(app, {
+  localCache: persistentLocalCache({
+    tabManager: persistentMultipleTabManager()
+  }),
   experimentalForceLongPolling: true,
+  experimentalAutoDetectLongPolling: false,
 }, databaseId);
 
 // Direct exports of common Firestore methods for convenience
